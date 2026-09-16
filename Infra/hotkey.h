@@ -32,6 +32,7 @@ private:
     static DWORD WINAPI PumpThread(LPVOID self);
 
     HANDLE m_thread = nullptr;
+    HANDLE m_readyEvent = nullptr;
     DWORD m_threadId = 0;
     int m_hotkeyId = 1;
     std::atomic<bool> m_registered{false};

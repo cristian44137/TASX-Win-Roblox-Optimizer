@@ -15,3 +15,9 @@ void AudioApplyBackgroundMute(const std::unordered_set<DWORD>& clientPids,
    GUIDs are defined locally via DEFINE_GUID-style literals, no uuid.lib needed. */
 void AudioMuteByPid(DWORD pid);
 void AudioUnmuteByPid(DWORD pid);
+
+/* Releases the session manager and any COM reference owned by this module. */
+void AudioShutdown(void);
+
+/* Drops TASX-owned mute state for an exited PID. */
+void AudioForgetPid(DWORD pid);

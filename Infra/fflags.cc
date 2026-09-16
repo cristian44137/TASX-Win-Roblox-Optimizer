@@ -124,28 +124,73 @@ size_t FindClosingQuote(const std::string& json, size_t from)
     return std::string::npos;
 }
 
-std::map<std::string, std::string> ParseFlags(const std::string& json)
+bool ParseFlags(const std::string& json, std::map<std::string, std::string>& out)
 {
-    std::map<std::string, std::string> out;
-
-    size_t i = 0;
-    while ((i = json.find('"', i)) != std::string::npos) {
+    out.clear();
+    size_t i = json.find_first_not_of(" \t\r\n");
+    if (i == std::string::npos || json[i] != '{') return false;
+    ++i;
+    for (;;) {
+        i = json.find_first_not_of(" \t\r\n", i);
+        if (i == std::string::npos) return false;
+        if (json[i] == '}') {
+            ++i;
+            return json.find_first_not_of(" \t\r\n", i) == std::string::npos;
+        }
+        if (json[i] != '"') return false;
         size_t keyEnd = FindClosingQuote(json, i + 1);
-        if (keyEnd == std::string::npos) break;
+        if (keyEnd == std::string::npos) return false;
         std::string key = json.substr(i + 1, keyEnd - i - 1);
 
-        size_t colon = json.find(':', keyEnd);
-        if (colon == std::string::npos) break;
+        size_t colon = json.find_first_not_of(" \t\r\n", keyEnd + 1);
+        if (colon == std::string::npos || json[colon] != ':') return false;
+        size_t vs = json.find_first_not_of(" \t\r\n", colon + 1);
+        if (vs == std::string::npos || json[vs] != '"') return false;
 
-        size_t vs = json.find('"', colon);
-        if (vs == std::string::npos) break;
         size_t ve = FindClosingQuote(json, vs + 1);
-        if (ve == std::string::npos) break;
+        if (ve == std::string::npos) return false;
 
         out[key] = json.substr(vs + 1, ve - vs - 1);
-        i = ve + 1;
+        i = json.find_first_not_of(" \t\r\n", ve + 1);
+        if (i == std::string::npos) return false;
+        if (json[i] == ',') {
+            ++i;
+            continue;
+        }
+        if (json[i] == '}') {
+            ++i;
+            return json.find_first_not_of(" \t\r\n", i) == std::string::npos;
+        }
+        return false;
     }
-    return out;
+}
+
+std::string JsonEscape(const std::string& value)
+{
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    static const char hex[] = "0123456789abcdef";
+    for (unsigned char c : value) {
+        switch (c) {
+        case '"': escaped += "\\\""; break;
+        case '\\': escaped += "\\\\"; break;
+        case '\b': escaped += "\\b"; break;
+        case '\f': escaped += "\\f"; break;
+        case '\n': escaped += "\\n"; break;
+        case '\r': escaped += "\\r"; break;
+        case '\t': escaped += "\\t"; break;
+        default:
+            if (c < 0x20) {
+                escaped += "\\u00";
+                escaped.push_back(hex[c >> 4]);
+                escaped.push_back(hex[c & 0x0f]);
+            } else {
+                escaped.push_back((char)c);
+            }
+            break;
+        }
+    }
+    return escaped;
 }
 
 std::string SerializeFlags(const std::map<std::string, std::string>& flags)
@@ -156,7 +201,8 @@ std::string SerializeFlags(const std::map<std::string, std::string>& flags)
     for (const auto& kv : flags) {
         if (!first) os << ",\n";
         first = false;
-        os << "  \"" << kv.first << "\": \"" << kv.second << "\"";
+        os << "  \"" << JsonEscape(kv.first) << "\": \""
+           << JsonEscape(kv.second) << "\"";
     }
     os << "\n}\n";
     return os.str();
@@ -167,9 +213,11 @@ std::string WideToUtf8(const std::wstring& w)
     if (w.empty()) return {};
     int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
                                 nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
     std::string s(n, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
-                        &s[0], n, nullptr, nullptr);
+    if (!WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
+                             &s[0], n, nullptr, nullptr))
+        return {};
     return s;
 }
 
@@ -343,7 +391,7 @@ void BuildFlagPlan(FlagPlan& plan)
         // No preset (legacy path) - respect [Roblox] section for backward compat.
         // Only allowlisted flags are written; dead values get a replacement hint.
         if (canWriteGraphics()) {
-            if (config_get_bool("Roblox", "UncapFps", 1)) {
+            if (config_get_bool("Roblox", "UncapFps", 0)) {
                 setSafe("DFIntTaskSchedulerTargetFps", "999");
                 setSafe("FFlagTaskSchedulerLimitTargetFpsTo2402", "False");
             } else {
@@ -522,6 +570,16 @@ bool ApplyToVersion(const std::wstring& versionDir, const FlagPlan& plan)
     // nor our plan changed since the last pass (farm spawns 100 clients -
     // re-reading every JSON on every spawn is pure I/O waste).
     static std::unordered_map<std::wstring, unsigned long long> s_fileCache;
+    auto rememberVerified = [&](const std::wstring& path,
+                                unsigned long long key) {
+        /* Roblox version directories are replaced over time. Bound this
+           process-local acceleration cache so a 24/7 farm cannot grow it
+           forever; a clear only causes harmless extra verification reads. */
+        if (s_fileCache.find(path) == s_fileCache.end() &&
+            s_fileCache.size() >= 4096)
+            s_fileCache.clear();
+        s_fileCache[path] = key;
+    };
     unsigned long long planHash = 1469598103934665603ull; // FNV-1a
     auto mix = [&](const std::string& s) {
         for (unsigned char c : s) {
@@ -532,9 +590,13 @@ bool ApplyToVersion(const std::wstring& versionDir, const FlagPlan& plan)
     };
     for (auto& kv : plan.set) { mix(kv.first); mix(kv.second); }
     for (auto& k : plan.remove) mix(k);
+    unsigned long long initialFileKey = 0;
+    bool hadInitialFileKey = false;
     {
         unsigned long long fkey = 0;
         if (FileKey(jsonPath, planHash, fkey)) {
+            initialFileKey = fkey;
+            hadInitialFileKey = true;
             auto it = s_fileCache.find(jsonPath);
             if (it != s_fileCache.end() && it->second == fkey)
                 return false; // already in desired state, verified last pass
@@ -543,12 +605,33 @@ bool ApplyToVersion(const std::wstring& versionDir, const FlagPlan& plan)
 
     CreateDirectoryW(clientDir.c_str(), nullptr);
 
+    const bool fileExisted = GetFileAttributesW(jsonPath.c_str()) != INVALID_FILE_ATTRIBUTES;
     std::ifstream in(jsonPath.c_str(), std::ios::binary);
+    const bool readable = in.is_open();
     std::string existing((std::istreambuf_iterator<char>(in)),
                           std::istreambuf_iterator<char>());
     in.close();
 
-    auto flags = ParseFlags(existing);
+    if (fileExisted && (!readable || existing.empty())) {
+        if (LogRateLimit("fflags-readfail", 60))
+            LOGW("[FFlags] Skip %s: existing ClientAppSettings.json is unreadable or empty; original preserved",
+                 WideToUtf8(jsonPath).c_str());
+        return false;
+    }
+    if (fileExisted && !hadInitialFileKey) {
+        if (LogRateLimit("fflags-statfail", 60))
+            LOGW("[FFlags] Skip %s: cannot verify its identity; original preserved",
+                 WideToUtf8(jsonPath).c_str());
+        return false;
+    }
+
+    std::map<std::string, std::string> flags;
+    if (!existing.empty() && !ParseFlags(existing, flags)) {
+        if (LogRateLimit("fflags-invalid-json", 60))
+            LOGW("[FFlags] Skip %s: invalid JSON shape; original preserved",
+                 WideToUtf8(jsonPath).c_str());
+        return false;
+    }
     for (const auto& k : plan.remove) flags.erase(k);
     for (const auto& kv : plan.set) flags[kv.first] = kv.second;
 
@@ -558,7 +641,7 @@ bool ApplyToVersion(const std::wstring& versionDir, const FlagPlan& plan)
         // Stat failure is ignored (simply no cache entry).
         unsigned long long fkey = 0;
         if (FileKey(jsonPath, planHash, fkey))
-            s_fileCache[jsonPath] = fkey;
+            rememberVerified(jsonPath, fkey);
         return false; /* nothing to do */
     }
 
@@ -569,6 +652,22 @@ bool ApplyToVersion(const std::wstring& versionDir, const FlagPlan& plan)
     if (!out) {
         LOGW("[FFlags] Failed to write into %s", WideToUtf8(versionDir).c_str());
         return false;
+    }
+
+    /* Do not overwrite a file changed by Roblox/an injector while we were
+       parsing it. The comparison is best-effort; if metadata is unavailable,
+       the safer choice is to skip rather than clobber concurrent changes. */
+    if (hadInitialFileKey) {
+        unsigned long long currentFileKey = 0;
+        if (!FileKey(jsonPath, planHash, currentFileKey) ||
+            currentFileKey != initialFileKey) {
+            out.close();
+            DeleteFileW(tmpPath.c_str());
+            if (LogRateLimit("fflags-concurrent", 60))
+                LOGW("[FFlags] Skip %s: file changed during read; original preserved",
+                     WideToUtf8(jsonPath).c_str());
+            return false;
+        }
     }
 
     if (!MoveFileExW(tmpPath.c_str(), jsonPath.c_str(),
@@ -586,7 +685,7 @@ bool ApplyToVersion(const std::wstring& versionDir, const FlagPlan& plan)
     {
         unsigned long long fkey = 0;
         if (FileKey(jsonPath, planHash, fkey))
-            s_fileCache[jsonPath] = fkey;
+            rememberVerified(jsonPath, fkey);
     }
 
     if (LogRateLimit("fflags-applied", 10))
@@ -653,8 +752,19 @@ void FFlagsApply()
     s_lastFFlagsMs = now;
 
     // Same compat rule as BuildFlagPlan: missing key -> 1 legacy, 0 with farm preset.
-    const char* pPre = config_get_str("FastFlags", "Preset", nullptr);
-    if (!pPre) pPre = config_get_str("TASX", "Preset", nullptr);
+    /* config_get_str() returns a TLS ring slot. Copy the value immediately:
+       the later config lookups in this function must not overwrite the
+       preset name used for planning and reporting. */
+    std::string presetValue;
+    const char* presetFromFastFlags = config_get_str("FastFlags", "Preset", nullptr);
+    if (presetFromFastFlags)
+        presetValue = presetFromFastFlags;
+    else {
+        const char* presetFromTasx = config_get_str("TASX", "Preset", nullptr);
+        if (presetFromTasx)
+            presetValue = presetFromTasx;
+    }
+    const char* pPre = presetValue.empty() ? nullptr : presetValue.c_str();
     bool hasPre = false;
     if (pPre) {
         char pl[16] = {};
@@ -721,8 +831,11 @@ void FFlagsApply()
 
         int n = MultiByteToWideChar(CP_UTF8, 0, item.c_str(), -1, nullptr, 0);
         if (n <= 1) continue;
-        std::wstring wItem(n - 1, L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, item.c_str(), -1, &wItem[0], n);
+        std::wstring wItem((size_t)n, L'\0');
+        if (!MultiByteToWideChar(CP_UTF8, 0, item.c_str(), -1,
+                                 &wItem[0], n))
+            continue;
+        wItem.resize((size_t)n - 1);
 
         int before = scanned;
         ScanVersionsRoot(wItem, plan, scanned, applied);

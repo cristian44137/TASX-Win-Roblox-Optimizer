@@ -7,6 +7,7 @@
 #include <iphlpapi.h>
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -22,9 +23,29 @@ std::string Narrow(const std::wstring& w)
     int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0,
                                 nullptr, nullptr);
     if (n <= 1) return std::string();
-    std::string s((size_t)(n - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], n, nullptr, nullptr);
+    /* The size query includes the terminating NUL.  Keep that byte in the
+       temporary buffer while converting, then remove it; passing `n` to a
+       buffer of `n-1` bytes is a one-byte overwrite. */
+    std::string s((size_t)n, '\0');
+    if (!WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], n,
+                             nullptr, nullptr))
+        return std::string();
+    s.resize((size_t)n - 1);
     return s;
+}
+
+std::wstring Utf8ToWide(const char* text)
+{
+    if (!text || !text[0]) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                text, -1, nullptr, 0);
+    if (n <= 1) return std::wstring();
+    std::wstring w((size_t)n, L'\0');
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                             text, -1, &w[0], n))
+        return std::wstring();
+    w.resize((size_t)n - 1);
+    return w;
 }
 
 std::wstring ExpandPath(std::wstring p)
@@ -78,6 +99,14 @@ bool CreateJunction(const std::wstring& link, const std::wstring& target)
         WCHAR PathBuffer[520];
     } buf = {};
     #pragma pack(pop)
+
+    if (sub.size() >= sizeof(buf.PathBuffer) / sizeof(buf.PathBuffer[0])) {
+        LOGW("[Net] Junction target is too long; refusing unsafe reparse buffer for %s",
+             Narrow(link).c_str());
+        CloseHandle(h);
+        if (createdDir) RemoveDirectoryW(link.c_str());
+        return false;
+    }
 
     WORD subBytes = (WORD)(sub.size() * sizeof(wchar_t));
     buf.ReparseTag = IO_REPARSE_TAG_MOUNT_POINT;
@@ -152,7 +181,11 @@ void NetCacheApply()
 {
     const char* root = config_get_str("Net", "SharedCacheRoot", "");
     if (!root[0]) return;
-    std::wstring wroot(root, root + strlen(root));
+    std::wstring wroot = Utf8ToWide(root);
+    if (wroot.empty()) {
+        LOGW("[Net] SharedCacheRoot is not valid UTF-8; cache links skipped");
+        return;
+    }
 
     const char* links = config_get_str("Net", "CacheLinks", "");
     std::string s(links);
@@ -169,10 +202,8 @@ void NetCacheApply()
         item = item.substr(b, e - b + 1);
         if (item.size() < 4) continue;
 
-        int n = MultiByteToWideChar(CP_UTF8, 0, item.c_str(), -1, nullptr, 0);
-        if (n <= 1) continue;
-        std::wstring w(n - 1, L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, item.c_str(), -1, &w[0], n);
+        std::wstring w = Utf8ToWide(item.c_str());
+        if (w.empty()) continue;
         EnsureSharedCache(w, wroot);
     }
 }
@@ -260,7 +291,11 @@ void NetCacheTrimIfOversized()
        small files. */
     if (!LogRateLimit("cache-trim-scan", 600)) return;
 
-    std::wstring wroot(root, root + strlen(root));
+    std::wstring wroot = Utf8ToWide(root);
+    if (wroot.empty()) {
+        LOGW("[Net] SharedCacheRoot is not valid UTF-8; cache trim skipped");
+        return;
+    }
     DWORD attrs = GetFileAttributesW(wroot.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES ||
         !(attrs & FILE_ATTRIBUTE_DIRECTORY) ||

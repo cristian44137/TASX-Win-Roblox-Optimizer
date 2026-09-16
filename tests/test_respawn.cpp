@@ -124,6 +124,33 @@ int main(void)
         }
     }
 
+    /* 5. Commit pressure defers respawn instead of forgetting the dead
+       client. Once pressure clears and the deferred item is due, retrying a
+       non-existent executable fails cleanly and drops the stale record. */
+    RespawnClearAll();
+    {
+        char ini[256];
+        snprintf(ini, sizeof(ini), "tests/.build/respawn_commit_block.ini");
+        FILE* f = fopen(ini, "wb");
+        if (f) {
+            fprintf(f, "[TASX]\nRespawnOnCrash=1\nCommitBlockThreshold=50\n");
+            fclose(f);
+        }
+        config_reload(ini);
+        RespawnRemember(301, L"Z:\\definitely_missing_tasx_test.exe --client");
+        RespawnTestSetCommitPercent(90);
+        CHECK("commit pressure defers", RespawnTrySpawn(301) == 0);
+        CHECK_WS("deferred record kept", RespawnPendingCount(), (size_t)1);
+        CHECK_WS("deferred queue count", RespawnTestDeferredCount(), (size_t)1);
+
+        RespawnTestSetCommitPercent(0);
+        RespawnTestForcePendingDue(301);
+        RespawnRetryPending();
+        CHECK_WS("failed retry drops command", RespawnPendingCount(), (size_t)0);
+        CHECK_WS("failed retry drops deferred", RespawnTestDeferredCount(), (size_t)0);
+        RespawnTestSetCommitPercent(-2);
+    }
+
     printf("\nrespawn  %3d passed, %d failed\n", g_pass, g_fail);
     printf("TOTAL: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

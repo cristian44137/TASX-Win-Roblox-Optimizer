@@ -5,6 +5,8 @@
 #include "ntsys.h"
 #include "log.h"
 #include "lograte.h"
+#include "metrics.h"
+#include "stats.h"
 
 #include <psapi.h>
 
@@ -13,6 +15,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <queue>
 #include <unordered_map>
@@ -34,8 +37,24 @@ std::unordered_map<DWORD, HANDLE> g_handles;   /* pid -> proc handle */
 std::unordered_map<DWORD, SIZE_T> g_wsCache;   /* pid -> last WS bytes (from master) */
 std::unordered_map<DWORD, std::int64_t> g_wsTime; /* pid -> cache timestamp ms */
 std::unordered_map<DWORD, std::int64_t> g_unfocusedSince; /* pid -> when lost focus */
+struct IdleState {
+    bool idle = false;
+    std::int64_t since = 0;
+    std::int64_t lastUpdate = 0;
+};
+std::unordered_map<DWORD, IdleState> g_idle;
 std::atomic<DWORD> g_focusedPid{0};
 std::atomic<int> g_pageInPause{0};
+/* FarmBoost (Ctrl+Alt+B): "trim paused" per the boosted-farm contract.
+   Kept separate from g_pageInPause (different lifetime/owner) but checked
+   together via TrimmingPaused() below so every call site only needs to
+   ask one question. */
+std::atomic<int> g_farmBoostPause{0};
+
+bool TrimmingPaused()
+{
+    return g_pageInPause.load() != 0 || g_farmBoostPause.load() != 0;
+}
 
 HANDLE g_hThread = nullptr;
 HANDLE g_hStop = nullptr;
@@ -144,17 +163,70 @@ static unsigned long BgMemPrio()
     return CpuBackgroundMemPrio(); // single source of truth lives in CPU.cc
 }
 
-void SoftTrim(HANDLE h)
+bool QueryTrimSnapshot(HANDLE h, TrimMetricSnapshot& out, DWORD pid,
+                       const char* type)
 {
-    if (!config_get_bool("TASX", "TrimUnfocused", 1)) return; // never page out
-    tasx_set_memory_priority(h, BgMemPrio());
-    SetProcessWorkingSetSizeEx(h, (SIZE_T)-1, (SIZE_T)-1, 0);
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (!GetProcessMemoryInfo(h, (PROCESS_MEMORY_COUNTERS*)&counters,
+                              sizeof(counters)))
+        return false;
+
+    out = {};
+    out.pid = pid;
+    out.type = type;
+    out.wsBefore = counters.WorkingSetSize;
+    out.privateBefore = counters.PrivateUsage;
+    out.commitBefore = tasx_get_commit_percent();
+    out.hasHardFaultsBefore = QuerySystemHardFaults(out.hardFaultsBefore);
+    return true;
 }
 
-void HardTrim(HANDLE h)
+void FinishTrimSnapshot(HANDLE h, TrimMetricSnapshot& out)
 {
-    if (!config_get_bool("TASX", "TrimUnfocused", 1)) return; // never page out
-    EmptyWorkingSet(h);
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (GetProcessMemoryInfo(h, (PROCESS_MEMORY_COUNTERS*)&counters,
+                              sizeof(counters))) {
+        out.wsAfter = counters.WorkingSetSize;
+        out.privateAfter = counters.PrivateUsage;
+    }
+    out.commitAfter = tasx_get_commit_percent();
+    out.hasHardFaultsAfter = QuerySystemHardFaults(out.hardFaultsAfter);
+    MetricsRecordTrim(out);
+}
+
+void SoftTrim(HANDLE h, DWORD pid, const char* reason)
+{
+    if (!config_get_bool("TASX", "TrimUnfocused", 0)) return; // user disabled
+    TrimMetricSnapshot metric;
+    bool measured = QueryTrimSnapshot(h, metric, pid, "soft");
+    tasx_set_memory_priority(h, BgMemPrio());
+    BOOL ok = SetProcessWorkingSetSizeEx(h, (SIZE_T)-1, (SIZE_T)-1, 0);
+    if (measured) {
+        FinishTrimSnapshot(h, metric);
+        if (reason && LogRateLimit("trim-soft-reason", 60))
+            LOGI("[Trimmer] SoftTrim PID %lu reason=%s api=%d WS %llu->%llu MB",
+                 pid, reason, ok ? 1 : 0,
+                 (unsigned long long)(metric.wsBefore >> 20),
+                 (unsigned long long)(metric.wsAfter >> 20));
+    }
+}
+
+void HardTrim(HANDLE h, DWORD pid, const char* reason)
+{
+    if (!config_get_bool("TASX", "TrimUnfocused", 0)) return; // user disabled
+    TrimMetricSnapshot metric;
+    bool measured = QueryTrimSnapshot(h, metric, pid, "hard");
+    BOOL ok = EmptyWorkingSet(h);
+    if (measured) {
+        FinishTrimSnapshot(h, metric);
+        if (reason && LogRateLimit("trim-hard-reason", 60))
+            LOGW("[Trimmer] HardTrim PID %lu reason=%s api=%d WS %llu->%llu MB",
+                 pid, reason, ok ? 1 : 0,
+                 (unsigned long long)(metric.wsBefore >> 20),
+                 (unsigned long long)(metric.wsAfter >> 20));
+    }
 }
 
 bool BelowSkipThresholdCached(DWORD pid)
@@ -180,65 +252,52 @@ bool BelowSkipThresholdCached(DWORD pid)
    possibly recycled) handle. Holding it also makes the g_wsCache reads inside
    BelowSkipThresholdCached() safe against the writer thread
    (TrimmerUpdateWorkingSet). No function called here re-enters g_mtx. */
+static bool IsIdleForAggressiveLocked(DWORD pid, std::int64_t now)
+{
+    auto it = g_idle.find(pid);
+    if (it == g_idle.end() || !it->second.idle) return false;
+    int idleSec = config_get_int("TASX", "IdleTrimSec", 60);
+    if (idleSec < 1) idleSec = 60;
+    return now - it->second.since >= (std::int64_t)idleSec * 1000;
+}
+
 static void TrimClientLocked(DWORD pid, HANDLE h, int& trimmed, int& skipped,
                              int& softOnly)
 {
-    // Commit-critical path: hard trim, but still never the focused instance
-    // (filtered by the caller) and never below-skip-threshold processes
-    // (trimming them only causes re-faults, zero gain).
-    int pct = tasx_get_commit_percent();
-    if (pct >= 90) {
-        if (BelowSkipThresholdCached(pid)) {
-            ++skipped;
-        } else {
-            if (LogRateLimit("trim-commit90", 60))
-                LOGW("[Trimmer] Commit %d%% -> hard trim PID %lu (reason: commit-critical)",
-                     pct, pid);
-            HardTrim(h);
-            ++trimmed;
-            static std::int64_t lastPurge = 0;
-            std::int64_t now = NowMs();
-            if (now - lastPurge > 30000) {
-                if (tasx_is_elevated()) tasx_purge_standby_list();
-                lastPurge = now;
-            }
-        }
-        return;
-    }
+    /* IdleTrimEnabled is intentionally opt-in. When disabled, a scheduled
+       soft trim remains the legacy behavior; aggressive hard trim is never
+       inferred from WS growth alone. */
+    bool idleEnabled = config_get_bool("TASX", "IdleTrimEnabled", 0) != 0;
+    std::int64_t now = NowMs();
+    bool idle = IsIdleForAggressiveLocked(pid, now);
 
     if (BelowSkipThresholdCached(pid)) {
-        ++skipped; // no syscall, just count
+        ++skipped;
         return;
     }
 
-    // Two-phase logic (farm-aware)
-    std::int64_t unfocusedMs = 0;
-    auto itU = g_unfocusedSince.find(pid);
-    if (itU != g_unfocusedSince.end()) {
-        unfocusedMs = NowMs() - itU->second;
-    } else {
-        // first time we see unfocused, mark now
-        g_unfocusedSince[pid] = NowMs();
-        unfocusedMs = 0;
+    /* No automatic hard trim on commit pressure. CommitLimitAction=softtrim
+       calls TrimmerRequestSoftTrim explicitly and is separately rate-limited. */
+    if (!idleEnabled || !idle) {
+        SoftTrim(h, pid, "scheduled");
+        ++softOnly;
+        return;
     }
 
-    SoftTrim(h); // soft pass always
-    bool doHard = false;
-    if (IsFarmKeepHot()) {
-        // farm: hard only after hours-scale inactivity, never on cadence
-        doHard = (unfocusedMs > HardTrimAfterMs());
-    } else {
-        doHard = (unfocusedMs > 2 * IntervalMs());
-    }
-    if (doHard) {
-        HardTrim(h);
+    SoftTrim(h, pid, "idle");
+    ++softOnly;
+    std::int64_t hardAfter = IsFarmKeepHot() ? HardTrimAfterMs()
+                                             : (std::int64_t)config_get_int("TASX", "HardTrimAfterSec", 600) * 1000;
+    if (hardAfter < 60000) hardAfter = 60000;
+    auto itU = g_unfocusedSince.find(pid);
+    std::int64_t unfocusedMs = itU == g_unfocusedSince.end() ? 0 : now - itU->second;
+    if (unfocusedMs >= hardAfter) {
+        HardTrim(h, pid, "idle-timeout");
         ++trimmed;
-    } else {
-        ++softOnly;
     }
 }
 
-DWORD WINAPI SchedulerThread(LPVOID)
+DWORD WINAPI SchedulerThreadImpl(LPVOID)
 {
     std::int64_t lastLog = NowMs();
     int trimmed = 0, skipped = 0, softOnly = 0;
@@ -278,7 +337,7 @@ DWORD WINAPI SchedulerThread(LPVOID)
         }
         /* WAIT_TIMEOUT: a heap deadline fired — fall through. */
 
-        if (!config_get_bool("TASX", "TrimUnfocused", 1)) {
+        if (!config_get_bool("TASX", "TrimUnfocused", 0)) {
             Sleep(30000);
             continue;
         }
@@ -304,9 +363,10 @@ DWORD WINAPI SchedulerThread(LPVOID)
                serialised against in-flight trimming. */
             std::lock_guard<std::mutex> lk(g_mtx);
 
-            if (g_pageInPause.load() || g_focusedPid.load() == pid) {
+            if (TrimmingPaused() || g_focusedPid.load() == pid) {
                 g_heap.push({NowMs() + 3000, pid}); // never fight the player
                 g_unfocusedSince.erase(pid);
+                g_idle.erase(pid);
                 continue;
             }
 
@@ -351,11 +411,29 @@ DWORD WINAPI SchedulerThread(LPVOID)
     return 0;
 }
 
+DWORD WINAPI SchedulerThread(LPVOID arg) noexcept
+{
+    try {
+        return SchedulerThreadImpl(arg);
+    } catch (const std::exception& ex) {
+        LOGE("[Trimmer] Scheduler exception: %s; scheduler stopped safely", ex.what());
+    } catch (...) {
+        LOGE("[Trimmer] Scheduler exception; scheduler stopped safely");
+    }
+    return 0;
+}
+
 } // namespace
 
 void TrimmerSetPageInPause(int on)
 {
     g_pageInPause.store(on ? 1 : 0);
+    if (g_hWake) SetEvent(g_hWake);
+}
+
+void TrimmerSetFarmBoost(int on)
+{
+    g_farmBoostPause.store(on ? 1 : 0);
     if (g_hWake) SetEvent(g_hWake);
 }
 
@@ -365,6 +443,7 @@ void TrimmerSetFocused(DWORD pid)
     std::lock_guard<std::mutex> lk(g_mtx);
     if (pid) {
         g_unfocusedSince.erase(pid);
+        g_idle.erase(pid);
     } else {
         // lost focus: mark all current as unfocused start if not already
         std::int64_t now = NowMs();
@@ -378,7 +457,7 @@ void TrimmerSetFocused(DWORD pid)
 
 bool StartTrimmer(DWORD pid, HANDLE processHandle)
 {
-    if (!config_get_bool("TASX", "TrimUnfocused", 1))
+    if (!config_get_bool("TASX", "TrimUnfocused", 0))
         return false;
 
     bool needStart = false;
@@ -399,6 +478,13 @@ bool StartTrimmer(DWORD pid, HANDLE processHandle)
         if (needStart) {
             g_hStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             g_hWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!g_hStop || !g_hWake) {
+                LOGE("[Trimmer] Failed to create scheduler events");
+                if (g_hStop) { CloseHandle(g_hStop); g_hStop = nullptr; }
+                if (g_hWake) { CloseHandle(g_hWake); g_hWake = nullptr; }
+                g_handles.erase(pid);
+                return false;
+            }
         }
     }
 
@@ -406,6 +492,8 @@ bool StartTrimmer(DWORD pid, HANDLE processHandle)
         g_hThread = CreateThread(nullptr, 0, SchedulerThread, nullptr, 0, nullptr);
         if (!g_hThread) {
             LOGE("[Trimmer] Failed to create scheduler thread");
+            std::lock_guard<std::mutex> lock(g_mtx);
+            g_handles.erase(pid);
             if (g_hStop) { CloseHandle(g_hStop); g_hStop = nullptr; }
             if (g_hWake) { CloseHandle(g_hWake); g_hWake = nullptr; }
             return false;
@@ -423,6 +511,7 @@ void StopTrimmer(DWORD pid)
     g_wsCache.erase(pid);
     g_wsTime.erase(pid);
     g_unfocusedSince.erase(pid);
+    g_idle.erase(pid);
     // heap entry is skipped lazily on pop
     if (g_hWake) SetEvent(g_hWake);
 }
@@ -441,6 +530,52 @@ void TrimmerRemoveWorkingSet(DWORD pid)
     g_wsTime.erase(pid);
 }
 
+void TrimmerUpdateIdle(DWORD pid, int idle, ULONGLONG nowMs)
+{
+    std::lock_guard<std::mutex> lock(g_mtx);
+    IdleState& state = g_idle[pid];
+    state.lastUpdate = (std::int64_t)nowMs;
+    if (idle && g_focusedPid.load() != pid) {
+        if (!state.idle) state.since = (std::int64_t)nowMs;
+        state.idle = true;
+    } else {
+        state.idle = false;
+        state.since = 0;
+    }
+    if (g_hWake) SetEvent(g_hWake);
+}
+
+bool TrimmerIsIdle(DWORD pid, ULONGLONG nowMs)
+{
+    std::lock_guard<std::mutex> lock(g_mtx);
+    auto it = g_idle.find(pid);
+    if (it == g_idle.end() || !it->second.idle) return false;
+    int idleSec = config_get_int("TASX", "IdleTrimSec", 60);
+    if (idleSec < 1) idleSec = 60;
+    return nowMs >= (ULONGLONG)it->second.since &&
+           nowMs - (ULONGLONG)it->second.since >= (ULONGLONG)idleSec * 1000;
+}
+
+void TrimmerRequestSoftTrim(DWORD pid, const char* reason)
+{
+    if (!config_get_bool("TASX", "TrimUnfocused", 0)) return;
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (g_focusedPid.load() == pid || TrimmingPaused()) return;
+    auto it = g_handles.find(pid);
+    if (it == g_handles.end()) return;
+    auto idleIt = g_idle.find(pid);
+    int idleSec = config_get_int("TASX", "IdleTrimSec", 60);
+    if (idleSec < 1) idleSec = 60;
+    bool idle = idleIt != g_idle.end() && idleIt->second.idle &&
+                NowMs() - idleIt->second.since >= (std::int64_t)idleSec * 1000;
+    if (!idle) {
+        if (LogRateLimit("commit-soft-active", 60))
+            LOGW("[Trimmer] SoftTrim request PID %lu skipped: client is active or idle threshold not met", pid);
+        return;
+    }
+    SoftTrim(it->second, pid, reason ? reason : "requested");
+}
+
 void TrimmerTrimAllAggressive()
 {
     // Hard trim ONLY for long-inactive background clients.
@@ -448,9 +583,9 @@ void TrimmerTrimAllAggressive()
     // Below-TrimSkipBelowMB processes are skipped entirely (0 syscalls
     // beyond the cached check). Focused instance is never touched.
     // FarmBoost ON: the whole farm runs hot — nothing is trimmed at all.
-    if (g_pageInPause.load()) {
+    if (TrimmingPaused()) {
         if (LogRateLimit("trim-pagein", 60))
-            LOGI("[Trimmer] Aggressive skipped (page-in in progress)");
+            LOGI("[Trimmer] Aggressive skipped (page-in/FarmBoost in progress)");
         return;
     }
     DWORD focused = g_focusedPid.load();
@@ -458,38 +593,51 @@ void TrimmerTrimAllAggressive()
     std::int64_t now = NowMs();
     std::int64_t hardAfterMs = IsFarmKeepHot() ? HardTrimAfterMs()
                                                : 2 * IntervalMs();
-    std::vector<HANDLE> soft;
-    std::vector<HANDLE> hard;
-    {
-        std::lock_guard<std::mutex> lock(g_mtx);
-        for (auto& kv : g_handles) {
-            if (kv.first == focused) continue;
-            auto itW = g_wsCache.find(kv.first);
-            auto itT = g_wsTime.find(kv.first);
-            if (skipMB > 0 && itW != g_wsCache.end() && itT != g_wsTime.end() &&
-                (now - itT->second) <= 30000 &&
-                itW->second < (SIZE_T)(unsigned)skipMB << 20)
-                continue; // below threshold, fresh cache: skip
-            auto itU = g_unfocusedSince.find(kv.first);
-            std::int64_t age = (itU != g_unfocusedSince.end()) ? (now - itU->second) : 0;
-            if (age > hardAfterMs)
-                hard.push_back(kv.second);
-            else
-                soft.push_back(kv.second);
+    unsigned softCount = 0, hardCount = 0;
+
+    /* Everything - including the actual trim syscalls - runs under g_mtx.
+       FIX: this used to copy HANDLEs into local vectors, release the lock,
+       and THEN call Soft/HardTrim on them. That's exactly the hazard the
+       comment above TrimClientLocked warns about: if ReleaseClient() (main
+       thread) closes one of those PIDs in the gap between releasing the
+       lock and using the handle, this thread trims through a closed (and
+       possibly OS-recycled) handle - a real, if rare, use-after-close.
+       Holding the lock for the whole pass costs a bit of contention with
+       the scheduler thread but makes the module's own stated invariant
+       actually true. */
+    std::lock_guard<std::mutex> lock(g_mtx);
+    for (auto& kv : g_handles) {
+        if (kv.first == focused) continue;
+        auto itW = g_wsCache.find(kv.first);
+        auto itT = g_wsTime.find(kv.first);
+        if (skipMB > 0 && itW != g_wsCache.end() && itT != g_wsTime.end() &&
+            (now - itT->second) <= 30000 &&
+            itW->second < (SIZE_T)(unsigned)skipMB << 20)
+            continue; // below threshold, fresh cache: skip
+        auto itU = g_unfocusedSince.find(kv.first);
+        std::int64_t age = (itU != g_unfocusedSince.end()) ? (now - itU->second) : 0;
+        if (age > hardAfterMs) {
+            HardTrim(kv.second, kv.first, "aggressive-idle-timeout");
+            ++hardCount;
+        } else {
+            SoftTrim(kv.second, kv.first, "aggressive-idle");
+            ++softCount;
         }
     }
-    for (HANDLE h : soft) SoftTrim(h);
-    for (HANDLE h : hard) HardTrim(h);
-    if (!soft.empty() || !hard.empty())
+    if (softCount || hardCount)
         LOGI("[Trimmer] Aggressive: %u soft, %u hard (reason: low-mem/commit, focused untouched)",
-             (unsigned)soft.size(), (unsigned)hard.size());
+             softCount, hardCount);
 }
 
 void StopAllTrimmers()
 {
     if (g_hStop) SetEvent(g_hStop);
     if (g_hThread) {
-        WaitForSingleObject(g_hThread, 5000);
+        /* The scheduler only waits on g_hStop/g_hWake and must be fully
+           stopped before either event is closed.  A timeout here would leave
+           a live thread dereferencing handles that the teardown immediately
+           invalidates. */
+        WaitForSingleObject(g_hThread, INFINITE);
         CloseHandle(g_hThread);
         g_hThread = nullptr;
     }
@@ -501,5 +649,6 @@ void StopAllTrimmers()
     g_wsCache.clear();
     g_wsTime.clear();
     g_unfocusedSince.clear();
+    g_idle.clear();
     while (!g_heap.empty()) g_heap.pop();
 }

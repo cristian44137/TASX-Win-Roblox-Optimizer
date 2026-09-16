@@ -8,3 +8,7 @@
    limit fails window creation randomly. TASX watches each client and warns
    rate-limited before the cliff. */
 void DesktopCheckClient(DWORD pid, HANDLE hProc);
+
+/* Drops rate-limit state when a tracked client exits, preventing PID reuse
+   and long-running respawn farms from growing the observer map forever. */
+void DesktopForgetClient(DWORD pid);

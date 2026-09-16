@@ -24,11 +24,19 @@ static const GUID k_IID_ISimpleAudioVolume =
 
 bool g_triedInit = false;
 IAudioSessionManager2* g_mgr = nullptr;
+bool g_audioComRef = false;
+std::unordered_set<DWORD> g_mutedByTasx;
 
 bool EnsureSessionManager()
 {
     if (g_triedInit) return g_mgr != nullptr;
     g_triedInit = true;
+
+    HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (comHr == S_OK || comHr == S_FALSE)
+        g_audioComRef = true;
+    else if (comHr != RPC_E_CHANGED_MODE)
+        return false;
 
     IMMDeviceEnumerator* devEnum = nullptr;
     HRESULT hr = CoCreateInstance(k_CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
@@ -47,8 +55,9 @@ bool EnsureSessionManager()
 
 } /* namespace */
 
-static bool SetMuteForPid(DWORD targetPid, BOOL mute)
+static bool SetMuteForPid(DWORD targetPid, BOOL mute, bool* changedOut = nullptr)
 {
+    if (changedOut) *changedOut = false;
     if (!EnsureSessionManager() || !g_mgr) return false;
 
     IAudioSessionEnumerator* se = nullptr;
@@ -68,9 +77,16 @@ static bool SetMuteForPid(DWORD targetPid, BOOL mute)
             if (pid == targetPid) {
                 ISimpleAudioVolume* vol = nullptr;
                 if (SUCCEEDED(ctl2->QueryInterface(k_IID_ISimpleAudioVolume, (void**)&vol))) {
-                    vol->SetMute(mute, nullptr);
+                    BOOL mutedNow = FALSE;
+                    if (SUCCEEDED(vol->GetMute(&mutedNow))) {
+                        if (mutedNow == mute) {
+                            found = true;
+                        } else if (SUCCEEDED(vol->SetMute(mute, nullptr))) {
+                            found = true;
+                            if (changedOut) *changedOut = true;
+                        }
+                    }
                     vol->Release();
-                    found = true;
                 }
             }
             ctl2->Release();
@@ -86,25 +102,32 @@ void AudioMuteByPid(DWORD pid)
 {
     if (!pid) return;
     if (!config_get_bool("TASX", "MuteBackground", 1)) return;
-    if (SetMuteForPid(pid, TRUE))
+    bool changed = false;
+    if (SetMuteForPid(pid, TRUE, &changed)) {
+        if (changed) g_mutedByTasx.insert(pid);
         LOGI("[Audio] Background client PID %lu muted", pid);
+    }
 }
 
 void AudioUnmuteByPid(DWORD pid)
 {
     if (!pid) return;
-    if (!config_get_bool("TASX", "MuteBackground", 1)) return;
-    // Unmute even if MuteBackground was toggled off? We always unmute on focus.
-    if (SetMuteForPid(pid, FALSE))
+    /* Always allow the compensating operation. This is also used when the
+       operator disables MuteBackground during a hot reload. */
+    if (!g_mutedByTasx.count(pid)) return;
+    if (SetMuteForPid(pid, FALSE)) {
+        g_mutedByTasx.erase(pid);
         LOGI("[Audio] Client PID %lu unmuted", pid);
+    }
 }
 
 void AudioApplyBackgroundMute(const std::unordered_set<DWORD>& clientPids,
                               DWORD focusedPid)
 {
-    if (!config_get_bool("TASX", "MuteBackground", 1)) return;
     if (clientPids.empty()) return;
     if (!EnsureSessionManager() || !g_mgr) return;
+
+    const bool muteEnabled = config_get_bool("TASX", "MuteBackground", 1) != 0;
 
     IAudioSessionEnumerator* se = nullptr;
     if (FAILED(g_mgr->GetSessionEnumerator(&se))) return;
@@ -126,7 +149,7 @@ void AudioApplyBackgroundMute(const std::unordered_set<DWORD>& clientPids,
 
             if (pid && clientPids.count(pid))
             {
-                bool wantMuted = focusedPid != 0 && pid != focusedPid;
+                bool wantMuted = muteEnabled && focusedPid != 0 && pid != focusedPid;
 
                 ISimpleAudioVolume* vol = nullptr;
                 if (SUCCEEDED(ctl2->QueryInterface(k_IID_ISimpleAudioVolume,
@@ -136,12 +159,16 @@ void AudioApplyBackgroundMute(const std::unordered_set<DWORD>& clientPids,
                     vol->GetMute(&mutedNow);
 
                     if (wantMuted && !mutedNow) {
-                        if (SUCCEEDED(vol->SetMute(TRUE, nullptr)))
+                        if (SUCCEEDED(vol->SetMute(TRUE, nullptr))) {
+                            g_mutedByTasx.insert(pid);
                             LOGI("[Audio] Background client PID %lu muted", pid);
+                        }
                     }
-                    else if (!wantMuted && mutedNow) {
-                        vol->SetMute(FALSE, nullptr);
-                        LOGI("[Audio] Client PID %lu unmuted", pid);
+                    else if (!wantMuted && mutedNow && g_mutedByTasx.count(pid)) {
+                        if (SUCCEEDED(vol->SetMute(FALSE, nullptr))) {
+                            g_mutedByTasx.erase(pid);
+                            LOGI("[Audio] Client PID %lu unmuted", pid);
+                        }
                     }
                     vol->Release();
                 }
@@ -151,4 +178,23 @@ void AudioApplyBackgroundMute(const std::unordered_set<DWORD>& clientPids,
         ctl->Release();
     }
     se->Release();
+}
+
+void AudioShutdown(void)
+{
+    if (g_mgr) {
+        g_mgr->Release();
+        g_mgr = nullptr;
+    }
+    if (g_audioComRef) {
+        CoUninitialize();
+        g_audioComRef = false;
+    }
+    g_mutedByTasx.clear();
+    g_triedInit = false;
+}
+
+void AudioForgetPid(DWORD pid)
+{
+    g_mutedByTasx.erase(pid);
 }

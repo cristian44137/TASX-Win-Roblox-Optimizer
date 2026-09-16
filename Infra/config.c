@@ -3,6 +3,7 @@
 #include "config.h"
 
 #include <windows.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -71,28 +72,12 @@ static void trim_inplace(char* s)
     *end = '\0';
 }
 
-static int find_entry(const char* section, const char* key)
-{
-    int i;
-    ensure_cfg_cs();
-    EnterCriticalSection(&g_cfgCs);
-    for (i = 0; i < g_count; ++i) {
-        if (ascii_ieq(g_entries[i].section, section) &&
-            ascii_ieq(g_entries[i].key, key)) {
-            LeaveCriticalSection(&g_cfgCs);
-            return i;
-        }
-    }
-    LeaveCriticalSection(&g_cfgCs);
-    return -1;
-}
-
 /* Parses iniPath into dst (CFG_MAX_ENTRIES slots) without locking - the
    caller holds g_cfgCs for the whole call. *dstCount receives the number of
    accepted entries, *dstTruncated becomes 1 when keys had to be dropped
    because the table was full. */
 static void parse_ini(const char* iniPath, CfgEntry* dst, int* dstCount,
-                      int* dstTruncated)
+                      int* dstTruncated, int* dstOpened)
 {
     FILE* fp;
     char line[256];
@@ -102,9 +87,11 @@ static void parse_ini(const char* iniPath, CfgEntry* dst, int* dstCount,
 
     *dstCount = 0;
     *dstTruncated = 0;
+    *dstOpened = 0;
 
     fp = fopen(iniPath, "r");
     if (!fp) return;
+    *dstOpened = 1;
 
     /* Skip a UTF-8 BOM if present, otherwise the first section header
        ("[TASX]" read as "\xEF\xBB\xBF[TASX]") never matches. */
@@ -210,7 +197,10 @@ void config_load(const char* iniPath)
     g_wasLoaded = 1;
     /* Hold the lock for the whole parse so concurrent readers (trimmer/job
        threads) never see a half-written entry. INI is tiny (< 5 KB). */
-    parse_ini(iniPath, g_entries, &g_count, &g_truncated);
+    {
+        int opened = 0;
+        parse_ini(iniPath, g_entries, &g_count, &g_truncated, &opened);
+    }
     LeaveCriticalSection(&g_cfgCs);
 }
 
@@ -238,49 +228,79 @@ void config_default_path(char* out, int outLen)
 
 int config_loaded(void)
 {
-    return g_wasLoaded && g_count > 0;
+    int loaded;
+    ensure_cfg_cs();
+    EnterCriticalSection(&g_cfgCs);
+    loaded = g_wasLoaded && g_count > 0;
+    LeaveCriticalSection(&g_cfgCs);
+    return loaded;
 }
 
 const char* config_get_str(const char* section, const char* key, const char* defVal)
 {
-    int idx = find_entry(section, key);
-    if (idx < 0) return defVal;
-    return g_entries[idx].value;
+    /* Do not return a pointer into g_entries: config_reload() replaces that
+       table under the lock. Copy into a TLS ring so readers remain valid
+       while another thread reloads the configuration. The ring supports
+       nested lookups without the second lookup overwriting the first. */
+    static _Thread_local char tls_values[8][CFG_VALUE_LEN];
+    static _Thread_local unsigned tls_next;
+    unsigned slot = tls_next++ % 8;
+    int i;
+
+    if (!section || !key) return defVal;
+    ensure_cfg_cs();
+    EnterCriticalSection(&g_cfgCs);
+    for (i = 0; i < g_count; ++i) {
+        if (ascii_ieq(g_entries[i].section, section) &&
+            ascii_ieq(g_entries[i].key, key)) {
+            memcpy(tls_values[slot], g_entries[i].value, CFG_VALUE_LEN);
+            tls_values[slot][CFG_VALUE_LEN - 1] = '\0';
+            LeaveCriticalSection(&g_cfgCs);
+            return tls_values[slot];
+        }
+    }
+    LeaveCriticalSection(&g_cfgCs);
+    return defVal;
 }
 
 int config_get_int(const char* section, const char* key, int defVal)
 {
     const char* v = config_get_str(section, key, NULL);
-    int result = 0;
-    int sign = 1;
+    unsigned long long result = 0;
+    int negative = 0;
+    unsigned long long limit;
 
     if (!v || v[0] == '\0') return defVal;
 
-    if (*v == '-') { sign = -1; ++v; }
+    if (*v == '-') { negative = 1; ++v; }
     else if (*v == '+') { ++v; }
 
+    limit = negative ? (unsigned long long)INT_MAX + 1ull
+                     : (unsigned long long)INT_MAX;
     while (*v >= '0' && *v <= '9') {
-        result = result * 10 + (*v - '0');
+        unsigned digit = (unsigned)(*v - '0');
+        if (result > (limit - digit) / 10ull)
+            return negative ? INT_MIN : INT_MAX;
+        result = result * 10ull + digit;
         ++v;
     }
-    return sign * result;
+    if (negative) {
+        if (result == (unsigned long long)INT_MAX + 1ull) return INT_MIN;
+        return -(int)result;
+    }
+    return (int)result;
 }
 
 int config_get_bool(const char* section, const char* key, int defVal)
 {
     const char* v = config_get_str(section, key, NULL);
-    char c;
 
     if (!v || v[0] == '\0') return defVal;
 
-    c = ascii_lower(v[0]);
-    if (c == '0' || c == 'f' || c == 'n' || c == 'o') {
-        /* 0, false, no, off */
-        if (ascii_ieq(v, "off")) return 0;
-        if (c == 'o') return 1; /* "on" */
-        return 0;
-    }
-    if (c == '1' || c == 't' || c == 'y') return 1;
+    if (ascii_ieq(v, "0") || ascii_ieq(v, "false") ||
+        ascii_ieq(v, "no") || ascii_ieq(v, "off")) return 0;
+    if (ascii_ieq(v, "1") || ascii_ieq(v, "true") ||
+        ascii_ieq(v, "yes") || ascii_ieq(v, "on")) return 1;
     return defVal;
 }
 
@@ -294,8 +314,15 @@ void config_reload(const char* iniPath)
        live thresholds for a few milliseconds. */
     EnterCriticalSection(&g_cfgCs);
     {
-        int count = 0, truncated = 0;
-        parse_ini(iniPath, g_scratch, &count, &truncated);
+        int count = 0, truncated = 0, opened = 0;
+        parse_ini(iniPath, g_scratch, &count, &truncated, &opened);
+        if (!opened) {
+            /* Editors and atomic writers can briefly remove/rename the file.
+               Keep the last-known-good table instead of making every worker
+               fall back to unrelated built-in defaults for that interval. */
+            LeaveCriticalSection(&g_cfgCs);
+            return;
+        }
         memcpy(g_entries, g_scratch, sizeof(g_entries));
         g_count = count;
         g_truncated = truncated;
@@ -306,7 +333,12 @@ void config_reload(const char* iniPath)
 
 int config_truncated(void)
 {
-    return g_truncated;
+    int truncated;
+    ensure_cfg_cs();
+    EnterCriticalSection(&g_cfgCs);
+    truncated = g_truncated;
+    LeaveCriticalSection(&g_cfgCs);
+    return truncated;
 }
 
 int config_max_entries(void)
@@ -363,7 +395,7 @@ int config_create_default(const char* iniPath)
         "; Trimmer: UNFOCUSED farm clients are WORKING, not idle (focused never trimmed).\n"
         "; FarmKeepHot=1: periodic pass is soft-only; hard trim only after\n"
         "; HardTrimAfterSec of continuous unfocus (or commit-critical >=90%).\n"
-        "TrimUnfocused=1\n"
+        "TrimUnfocused=0 ; safety default: do not evict unfocused clients\n"
         "TrimIntervalSec=10\n"
         "AdaptiveTrim=1\n"
         "TrimSkipBelowMB=250\n"
@@ -379,8 +411,8 @@ int config_create_default(const char* iniPath)
         "JobAssignMode=auto\n"
         "BackgroundCpuCapPercent=0\n"
         "JobCpuCapPercent=0 ; legacy alias for BackgroundCpuCapPercent\n"
-        "JobMemoryCapMB=8192 ; per-process cap: 0=off, 8192 for farm\n"
-        "KillOnAgentExit=1\n"
+        "JobMemoryCapMB=0 ; safety default: never let a job memory cap terminate a client\n"
+        "KillOnAgentExit=0 ; safety default: TASX exit must not kill Roblox clients\n"
         "CommitBlockThreshold=85\n"
         "MuteBackground=1\n"
         "PinBackgroundToECores=0\n"
@@ -396,13 +428,13 @@ int config_create_default(const char* iniPath)
         "PagefileWarnFreeGB=8\n"
         "\n"
         "; System cleaner (split: standby purge is safe, global empty-WS evicts farms)\n"
-        "LowMemReactor=1\n"
+        "LowMemReactor=0 ; opt-in: global memory cleanup can cause system-wide I/O spikes\n"
         "LowMemCooldownSec=30\n"
-        "SystemCleaner=1\n"
-        "SystemCleanStandby=1\n"
+        "SystemCleaner=0 ; opt-in: keep the agent from changing global memory state\n"
+        "SystemCleanStandby=0\n"
         "SystemCleanEmptyWS=0 ; 1=also empty ALL working sets (NOT for keep-hot farms)\n"
         "SystemCleanMinIntervalSec=60\n"
-        "PurgeStandbyOnLaunch=1 ; debounced to 1 per 60s for pack spawns\n"
+        "PurgeStandbyOnLaunch=0 ; opt-in: global standby purge\n"
         "\n"
         "; Watchdog\n"
         "SelfCpuWatchdogPercent=5\n"
@@ -410,7 +442,7 @@ int config_create_default(const char* iniPath)
         "; FarmBoost hotkey (Ctrl+Alt+B): page-in clients from pagefile (always P+E).\n"
         "; Format: Modifiers+Key (Ctrl/Alt/Shift/Win + A-Z/0-9/F1-F24), off=disabled.\n"
         "BoostHotkey=Ctrl+Alt+B\n"
-        "PageInIntervalSec=300\n"
+        "PageInIntervalSec=0 ; safety default: manual hotkey only, >0=opt-in auto page-in\n"
         "FarmBoostDefault=0 ; 1=start with the whole farm hot\n"
         "\n"
         "; Farm auto-respawn (opt-in for 24/7 farms): a crashed client is\n"
@@ -434,8 +466,8 @@ int config_create_default(const char* iniPath)
         "; TimerResolution 0.5ms is auto-disabled on farm presets without focus.\n"
         "KillCrashHandler=1\n"
         "TimerResolution=1\n"
-        "PowerPlan=1\n"
-        "ApplyTweaks=1\n"
+        "PowerPlan=0 ; opt-in: global power-plan changes are not crash-reversible\n"
+        "ApplyTweaks=0 ; opt-in: registry tweaks persist if the agent is hard-killed\n"
         "DisableCpuBoost=0\n"
         "WarmClientFiles=1\n"
         "WarmMaxMB=256\n"

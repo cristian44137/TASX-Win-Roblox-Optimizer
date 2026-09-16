@@ -27,6 +27,12 @@ bool JobApplyProfile(DWORD pid, int focused);
    No-op when nothing changed. */
 void JobsRefreshDynamic(int anyFocused);
 
+/* FarmBoost (Ctrl+Alt+B) toggle: while on, the shared background job runs
+   at full power (all cores, no CPU cap). Per-process NORMAL/IDLE priority
+   and EcoQoS are applied by master.cpp. Just flips the flag - call
+   JobsRefreshDynamic() right after to apply the job limits. */
+void JobsSetFarmBoost(int on);
+
 void JobRelease(DWORD pid);
 
 /* Implemented in master.cpp */

@@ -83,26 +83,42 @@ void FarmHotkey::Start()
         return;
     }
 
+    m_readyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!m_readyEvent) {
+        LOGW("[TASX] FarmBoost hotkey readiness event failed");
+        return;
+    }
+
     // The pump thread re-parses the combo itself: RegisterHotKey with a
     // NULL hwnd must run ON the thread that pumps messages.
     m_thread = CreateThread(nullptr, 0, PumpThread, this, 0, &m_threadId);
-    if (!m_thread)
+    if (!m_thread) {
+        CloseHandle(m_readyEvent);
+        m_readyEvent = nullptr;
         LOGW("[TASX] FarmBoost hotkey thread failed to start");
+    }
 }
 
 DWORD WINAPI FarmHotkey::PumpThread(LPVOID self)
 {
     auto* hk = static_cast<FarmHotkey*>(self);
 
+    MSG msg{};
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+
     const char* combo = config_get_str("TASX", "BoostHotkey", "Ctrl+Alt+B");
     UINT mod = 0, vk = 0;
-    if (!ParseCombo(combo, mod, vk)) return 0;
+    if (!ParseCombo(combo, mod, vk)) {
+        SetEvent(hk->m_readyEvent);
+        return 0;
+    }
 
     if (!RegisterHotKey(nullptr, hk->m_hotkeyId,
                         mod | MOD_NOREPEAT, vk)) {
         DWORD err = GetLastError();
         LOGW("[TASX] FarmBoost hotkey '%s' busy (err %lu) - pick another BoostHotkey or set off",
              combo, (unsigned long)err);
+        SetEvent(hk->m_readyEvent);
         return 0;
     }
     hk->m_registered.store(true);
@@ -113,7 +129,7 @@ DWORD WINAPI FarmHotkey::PumpThread(LPVOID self)
          comboLog);
     }
 
-    MSG msg{};
+    SetEvent(hk->m_readyEvent);
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (msg.message == WM_HOTKEY && (int)msg.wParam == hk->m_hotkeyId)
             TasxNotifyHotkey();
@@ -128,15 +144,17 @@ DWORD WINAPI FarmHotkey::PumpThread(LPVOID self)
 
 void FarmHotkey::Stop()
 {
-    if (m_registered) {
-        // Unregister from owner thread via message: post quit first, the
-        // pump unregisters before returning.
-    }
     if (m_thread) {
+        if (m_readyEvent)
+            WaitForSingleObject(m_readyEvent, INFINITE);
         PostThreadMessageW(m_threadId, WM_QUIT, 0, 0);
-        WaitForSingleObject(m_thread, 2000);
+        WaitForSingleObject(m_thread, INFINITE);
         CloseHandle(m_thread);
         m_thread = nullptr;
+    }
+    if (m_readyEvent) {
+        CloseHandle(m_readyEvent);
+        m_readyEvent = nullptr;
     }
     m_registered.store(false);
 }

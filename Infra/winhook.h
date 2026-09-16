@@ -28,5 +28,6 @@ private:
 
     HWINEVENTHOOK m_hook = nullptr;
     HANDLE m_pumpThread = nullptr;
+    HANDLE m_readyEvent = nullptr;
     DWORD m_pumpThreadId = 0;
 };

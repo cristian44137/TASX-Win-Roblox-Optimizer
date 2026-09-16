@@ -28,7 +28,7 @@ TASX следит за процессами Roblox (через WMI, хуки и 
 - Отключение Game DVR и фоновой записи; MMCSS-профиль `Games` поднят; сетевой троттлинг выключен (`SystemResponsiveness=0`).
 - GPU: high-performance preference для реального пути `RobloxPlayerBeta.exe` (fallback на имя exe).
 - Питание: схема Ultimate/High Performance на время игры, восстановление после.
-- Очистка Standby List при запуске Roblox (debounce 1/60 с для пачечных спавнов; требует админа). Система чистки разделена: `SystemCleanStandby=1` (безопасный reclaim page-cache) vs `SystemCleanEmptyWS=0` на фермах (глобальный empty working sets выселяет целые фермы — только opt-in).
+- Очистка Standby List при запуске Roblox (debounce 1/60 с для пачечных спавнов; требует админа) отключена по умолчанию. Система чистки разделена: `SystemCleanStandby=0` — безопасный default, `1` — явный opt-in reclaim page-cache; `SystemCleanEmptyWS=0` на фермах (глобальный empty working sets выселяет целые фермы — только opt-in).
 - Убийство `RobloxCrashHandler.exe` постоянным свипом (job-child фильтр: убиваются только crash handlers).
 - **FastFlags:** атомарная настройка `ClientAppSettings.json` для каждой установленной версии клиента (подробности в разделе «Под капотом»).
 
@@ -63,6 +63,7 @@ TASX следит за процессами Roblox (через WMI, хуки и 
 2. **Установка:** запустите `ScheduledTaskInstaller.bat` один раз. Это создаст задачу «TASX Agent», которая будет запускаться с повышенными привилегиями при старте системы.
 3. **Удаление:** надоело? Запустите `Uninstall.bat`. Всё почистится.
 4. **Один экземпляр:** нельзя запустить два TASX одновременно. Система не каменная, но и не бесконечная.
+5. **Безопасность остановки:** `KillOnAgentExit=0` — безопасный default для 24/7. При выходе или сбое TASX Roblox-клиенты не завершаются. `KillOnAgentExit=1` включайте только для временных disposable-сессий.
 
 ## 📥 Как скачать и использовать (для нормальных людей)
 
@@ -82,12 +83,16 @@ TASX следит за процессами Roblox (через WMI, хуки и 
 
 **MSYS2 / MinGW (Makefile):**
 
-- `mingw32-make` — консольная версия с логами (`TASX.exe`)
-- `mingw32-make windows` — тихая GUI-версия
+- `mingw32-make` — консольная версия с логами (`TASX.exe`), удобная для ручной проверки
+- `mingw32-make windows` — headless-версия для фонового запуска и Scheduled Task
 - `mingw32-make test` — юнит-тесты парсеров (config / fflags / respawn cmdline)
 - `mingw32-make clean` — убрать за собой мусор
 
-**build.bat** — сборка без make (нужен только g++ и windres из MSYS2 UCRT64; путь к тулчейну правится в шапке файла): `build.bat` — консольная, `build.bat silent` — GUI.
+**build.bat** — сборка без make (нужен только g++ и windres из MSYS2 UCRT64; путь к тулчейну правится в шапке файла): `build.bat` — консольная, `build.bat silent` — headless-фоновая.
+
+Важно: headless-сборка намеренно не создаёт окно и не показывает консоль. После запуска в диспетчере задач будет виден `TASX.exe`, а второй запуск завершится сообщением о уже работающем экземпляре. Для ручной проверки запускайте `run_debug.bat` или собирайте обычной командой `mingw32-make`; отдельного GUI/status-окна в текущей версии нет.
+
+Для режима «просто видеть, что происходит» один раз выполните `mingw32-make debug`, затем запускайте `run_debug.bat`. Он использует отдельный `TASX-debug.exe` и оставляет открытым обычное окно CMD с живым логом. Если уже работает агент из Scheduled Task, debug-запуск покажет сообщение о занятом экземпляре — сначала остановите фоновый `TASX.exe`.
 
 *Примечание:* `TASX.exe` должен лежать в одной папке с `.bat` файлами и `TASX.ini` (если он есть).
 
@@ -162,9 +167,9 @@ Infra/
 Все лог-строки идут через `LOGI/W/E` и rate-limited'ятся. `[Log] LogFile` — файловый лог (1 МБ ротация в `.old`, одновременный stdout), `LogLevel=info|warn|error`. `LogTimestamps=1` добавляет время к каждой строке файлового лога. Hot-reload: mtime `TASX.ini` поллится каждые 10 с на главном цикле — правки пере-применяют FFlags/tweaks/лимиты джобов и пороги триммера без рестарта и новых потоков.
 ### Ключи фермы `TASX.ini`
 
-`[TASX] JobAssignMode=auto|diagnose|off`, `FarmKeepHot=1`, `HardTrimAfterSec=1800`, `BackgroundMemPriority=2`, `TrimSkipBelowMB=250`, `SystemCleanStandby=1`, `SystemCleanEmptyWS=0`, `FocusDwellMs=1800` (легаси `FocusHysteresisMs` fallback), `PagefileWarnFreeGB=8`, `BackgroundCpuCapPercent=25`, `JobMemoryCapMB=8192` (per-process); `[FastFlags] Preset=farm20` + `FFlagsPruneDead=1` + ручные `key=value`; `[Roblox] UncapFps=0 TargetFps=20 Renderer=D3D10 Lighting=Voxel TextureQuality=0` (легаси, перекрывается пресетом; D3D10→D3D11, Voxel→PauseVoxelizer). Бюджетное правило: `N × avgWS < RAM × 0.75`, иначе keep-hot невозможен (rate-limited `LOGW`).
+`[TASX] JobAssignMode=auto|diagnose|off`, `FarmKeepHot=1`, `HardTrimAfterSec=1800`, `BackgroundMemPriority=2`, `TrimSkipBelowMB=250`, `SystemCleanStandby=0` (явный opt-in: `1`), `SystemCleanEmptyWS=0`, `FocusDwellMs=1800` (легаси `FocusHysteresisMs` fallback), `PagefileWarnFreeGB=8`, `BackgroundCpuCapPercent=25`, `JobMemoryCapMB=0` (без принудительного убийства клиентов); `[FastFlags] Preset=farm20` + `FFlagsPruneDead=1` + ручные `key=value`; `[Roblox] UncapFps=0 TargetFps=20 Renderer=D3D10 Lighting=Voxel TextureQuality=0` (легаси, перекрывается пресетом; D3D10→D3D11, Voxel→PauseVoxelizer). Бюджетное правило: `N × avgWS < RAM × 0.75`, иначе keep-hot невозможен (rate-limited `LOGW`).
 
-Новые ферма-ключи: `RespawnOnCrash=1`, `RespawnPerHourMax=6`, `HungClientWatch=1`, `HungKillAfterSecMin=60`, `CacheMaxGB=20`, `LogTimestamps=1`.
+Новые ферма-ключи: `RespawnOnCrash=1`, `RespawnPerHourMax=6` (лимит на command-line lineage, поэтому новый PID не обходит crash-loop protection), `HungClientWatch=1`, `HungKillAfterSecMin=60`, `CacheMaxGB=20`, `LogTimestamps=1`.
 
 Проектировался под 100+ одновременных клиентов: нет polling-циклов на горячем пути (выходы, crash handlers, чистка памяти и discovery — событийные), ~5 потоков независимо от числа клиентов, один syscall для состояния всей системы.
 

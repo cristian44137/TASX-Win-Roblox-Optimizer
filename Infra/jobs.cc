@@ -6,6 +6,9 @@
 #include "lograte.h"
 #include "stats.h"
 
+#include <atomic>
+#include <cstring>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -32,6 +35,13 @@ std::unordered_map<DWORD, int> g_pidJob;
 /* Background policy cache for JobsRefreshDynamic */
 DWORD_PTR g_dynamicBgMask = 0;
 bool      g_bgRateCap = false;
+int       g_dynamicCpuCap = -1;
+
+/* FarmBoost (Ctrl+Alt+B): while on, the shared background job runs at full
+   power (all cores, no CPU cap, higher priority) regardless of focus state
+   or DynamicAffinity. Toggled by master.cpp; read here without an extra
+   lock since it's a single atomic flag. */
+std::atomic<bool> g_farmBoostOn{false};
 
 /* JobAssignMode values: auto (default, try assign, sticky fallback on foreign Job),
    diagnose (same + log InJob info for broken foreign-job diagnostics),
@@ -48,7 +58,7 @@ int GetJobAssignMode()
         low[n] = c;
     }
     low[n] = '\0';
-    if (low[0] == 'o' && (low[1] == 'f' || low[1] == 'f')) return 2; // off
+    if (strcmp(low, "off") == 0) return 2; // off
     if ((low[0] == 'd' && low[1] == 'i') || (low[0] == 'f' && low[1] == 'o')) {
         // diagnose or deprecated force
         return 1;
@@ -65,14 +75,13 @@ bool ShouldLogPerPid(const char* prefix, DWORD pid, int intervalSec)
 
 DWORD_PTR GetBgMaskForCurrentPolicy(int anyFocused)
 {
-    unsigned long long eMask = tasx_get_ecore_mask();
+    (void)anyFocused;
     unsigned long long allMask = tasx_get_all_mask();
 
-    if (!config_get_bool("TASX", "DynamicAffinity", 0))
-        return (DWORD_PTR)allMask;
-    if (anyFocused)
-        return (DWORD_PTR)allMask;
-    /* farm: nothing focused - all cores, optionally rate-capped */
+    /* A shared job affinity applies to every member, including the focused
+       client. Keep the job's ceiling at all cores and let master.cpp apply
+       DynamicAffinity per process; this prevents a focused client from being
+       accidentally pinned to E-cores when another client is backgrounded. */
     return (DWORD_PTR)allMask;
 }
 
@@ -80,6 +89,9 @@ DWORD_PTR GetBgMaskForCurrentPolicy(int anyFocused)
    JobCpuCapPercent, default 20 in farm mode, 0 when something is focused. */
 int BgCpuCapPercent(int anyFocused)
 {
+    if (g_farmBoostOn.load(std::memory_order_relaxed))
+        return 0; // boosted: never rate-cap the farm
+
     int cap = config_get_int("TASX", "BackgroundCpuCapPercent", -1);
     if (cap < 0)
         cap = config_get_int("TASX", "JobCpuCapPercent", 0);
@@ -102,9 +114,11 @@ bool ApplyLimitsToJob(HANDLE job, DWORD_PTR bgMask, int cpuCap)
         return false;
 
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION ext{};
-    ext.BasicLimitInformation.LimitFlags =
-        JOB_OBJECT_LIMIT_PRIORITY_CLASS | JOB_OBJECT_LIMIT_AFFINITY;
-    ext.BasicLimitInformation.PriorityClass = IDLE_PRIORITY_CLASS;
+    /* Priority is deliberately per-process, not a job-wide limit. A job-level
+       IDLE limit prevents the focused client from being promoted to HIGH;
+       keeping only affinity/memory limits here lets master.cpp apply the
+       correct focused/background profile without container interference. */
+    ext.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_AFFINITY;
     ext.BasicLimitInformation.Affinity = bgMask ? bgMask : (DWORD_PTR)-1;
 
     int memCap = config_get_int("TASX", "JobMemoryCapMB", 0);
@@ -158,7 +172,7 @@ bool NameHas(const std::wstring& full, const wchar_t* needle)
     return hay.find(ndl) != std::wstring::npos;
 }
 
-DWORD WINAPI IocpLoop(LPVOID)
+DWORD WINAPI IocpLoopImpl(LPVOID)
 {
     for (;;) {
         DWORD code = 0;
@@ -174,6 +188,8 @@ DWORD WINAPI IocpLoop(LPVOID)
                 break;
             continue;
         }
+        if (!ov && code == 0)
+            break; /* orderly shutdown sentinel */
         DWORD pid = (DWORD)(ULONG_PTR)ov;
         if (code == JOB_OBJECT_MSG_EXIT_PROCESS) {
             TasxNotifyJobEvent(1, pid);
@@ -188,9 +204,23 @@ DWORD WINAPI IocpLoop(LPVOID)
     return 0;
 }
 
+DWORD WINAPI IocpLoop(LPVOID arg) noexcept
+{
+    try {
+        return IocpLoopImpl(arg);
+    } catch (const std::exception& ex) {
+        LOGE("[Jobs] IOCP worker exception: %s; worker stopped safely", ex.what());
+    } catch (...) {
+        LOGE("[Jobs] IOCP worker exception; worker stopped safely");
+    }
+    return 0;
+}
+
 bool CreateBackgroundJob()
 {
-    int killOnClose = config_get_bool("TASX", "KillOnAgentExit", 1);
+    /* Never let a missing/broken config turn agent shutdown into a farm-wide
+       kill. KILL_ON_JOB_CLOSE is an explicit opt-in for disposable sessions. */
+    int killOnClose = config_get_bool("TASX", "KillOnAgentExit", 0);
     g_jobBackground = tasx_job_create_ex(killOnClose ? 1 : 0);
     if (!g_jobBackground)
         return false;
@@ -207,10 +237,19 @@ bool CreateBackgroundJob()
     DWORD_PTR bgMask = GetBgMaskForCurrentPolicy(0);
     int cap = BgCpuCapPercent(0);
     bool ok = ApplyLimitsToJob(g_jobBackground, bgMask, cap);
+    if (!ok) {
+        /* Do not retain a half-configured Job Object: callers will use the
+           safer per-process path instead, and Roblox clients are never put
+           into an unknown policy container. */
+        if (LogRateLimit("jobs-applylimits", 60))
+            LOGW("[Jobs] Background cgroup policy failed; disabling Job assignment and using per-process fallback");
+        CloseHandle(g_jobBackground);
+        g_jobBackground = nullptr;
+        return false;
+    }
     g_dynamicBgMask = bgMask;
     g_bgRateCap = cap > 0;
-    if (!ok && LogRateLimit("jobs-applylimits", 60))
-        LOGW("[Jobs] Warning: background cgroup limits not fully applied");
+    g_dynamicCpuCap = cap;
     return true;
 }
 
@@ -238,13 +277,17 @@ bool JobsInit()
 
     if (!CreateBackgroundJob()) {
         LOGE("[Jobs] Failed to create background job");
-        CloseHandle(g_iocp);
-        g_iocp = nullptr;
         if (g_iocpThread) {
-            TerminateThread(g_iocpThread, 0);
+            /* Wake the IOCP worker and let it leave through its normal
+               control path. Closing the port underneath a blocked worker or
+               using TerminateThread can strand locks and corrupt teardown. */
+            PostQueuedCompletionStatus(g_iocp, 0, 0, nullptr);
+            WaitForSingleObject(g_iocpThread, INFINITE);
             CloseHandle(g_iocpThread);
             g_iocpThread = nullptr;
         }
+        CloseHandle(g_iocp);
+        g_iocp = nullptr;
         return false;
     }
 
@@ -335,19 +378,30 @@ void JobsRefreshDynamic(int anyFocused)
     int cap = BgCpuCapPercent(anyFocused);
     bool rateCap = cap > 0;
 
-    if (target == g_dynamicBgMask && rateCap == g_bgRateCap)
+    if (target == g_dynamicBgMask && rateCap == g_bgRateCap &&
+        cap == g_dynamicCpuCap)
         return;
 
+    if (!ApplyLimitsToJob(g_jobBackground, target, cap)) {
+        if (LogRateLimit("jobs-refresh-fail", 60))
+            LOGW("[Jobs] Failed to refresh background cgroup policy; retaining previous policy and retrying");
+        return;
+    }
     g_dynamicBgMask = target;
     g_bgRateCap = rateCap;
+    g_dynamicCpuCap = cap;
 
-    ApplyLimitsToJob(g_jobBackground, target, cap);
+    LOGI("[Jobs] Background job ceiling -> %s rewritten (CPU cap %d%%)",
+         rateCap ? "all cores (CPU-capped)" : "all cores", cap);
+}
 
-    unsigned long long all = tasx_get_all_mask();
-    LOGI("[Jobs] Background profile -> %s rewritten",
-         target == (DWORD_PTR)all
-             ? (rateCap ? "all cores (capped)" : "all cores")
-             : "E-cores / low half");
+void JobsSetFarmBoost(int on)
+{
+    g_farmBoostOn.store(on != 0, std::memory_order_relaxed);
+    /* Caller (master.cpp) is responsible for calling JobsRefreshDynamic()
+       right after this so the new mask/cap/priority are actually written
+       to the job object - this function only flips the flag that the
+       policy functions above read. */
 }
 
 void JobRelease(DWORD pid)
@@ -362,17 +416,25 @@ void JobShutdown()
         std::lock_guard<std::mutex> lock(g_mtx);
         g_pidJob.clear();
     }
+    if (g_iocpThread) {
+        /* Stop the worker before closing the port it is waiting on. A null
+           OVERLAPPED is an internal sentinel and is never interpreted as a
+           process PID by IocpLoop. */
+        if (g_iocp)
+            PostQueuedCompletionStatus(g_iocp, 0, 0, nullptr);
+        WaitForSingleObject(g_iocpThread, INFINITE);
+        CloseHandle(g_iocpThread);
+        g_iocpThread = nullptr;
+    }
     if (g_iocp) {
         CloseHandle(g_iocp);
         g_iocp = nullptr;
-    }
-    if (g_iocpThread) {
-        WaitForSingleObject(g_iocpThread, 2000);
-        CloseHandle(g_iocpThread);
-        g_iocpThread = nullptr;
     }
     if (g_jobBackground) {
         CloseHandle(g_jobBackground);
         g_jobBackground = nullptr;
     }
+    g_dynamicBgMask = 0;
+    g_bgRateCap = false;
+    g_dynamicCpuCap = -1;
 }

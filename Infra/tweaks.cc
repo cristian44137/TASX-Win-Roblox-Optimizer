@@ -6,6 +6,7 @@
 #include "lograte.h"
 
 #include <windows.h>
+#include <cstdio>
 #include <string>
 
 namespace {
@@ -150,6 +151,70 @@ const GUID kHighPerfGuid =
 
 GUID g_prevScheme = {};
 bool  g_prevSaved = false;
+GUID g_appliedScheme = {};
+
+bool GuidEqual(const GUID& a, const GUID& b)
+{
+    return memcmp(&a, &b, sizeof(GUID)) == 0;
+}
+
+bool IsTasxPowerScheme(const GUID& scheme)
+{
+    return GuidEqual(scheme, kUltimatePerfGuid) ||
+           GuidEqual(scheme, kHighPerfGuid);
+}
+
+std::wstring PowerJournalPath()
+{
+    wchar_t path[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return L"TASX.powerstate";
+    std::wstring result(path, n);
+    size_t slash = result.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return L"TASX.powerstate";
+    return result.substr(0, slash + 1) + L"TASX.powerstate";
+}
+
+bool SavePowerJournal(const GUID& scheme)
+{
+    const std::wstring path = PowerJournalPath();
+    const std::wstring tmp = path + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, &scheme, sizeof(scheme), &written, nullptr) &&
+              written == sizeof(scheme) && FlushFileBuffers(h);
+    CloseHandle(h);
+    if (!ok) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool LoadPowerJournal(GUID& scheme)
+{
+    HANDLE h = CreateFileW(PowerJournalPath().c_str(), GENERIC_READ,
+                           FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_HIDDEN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD read = 0;
+    BOOL ok = ReadFile(h, &scheme, sizeof(scheme), &read, nullptr) &&
+              read == sizeof(scheme);
+    CloseHandle(h);
+    return ok == TRUE;
+}
+
+void DeletePowerJournal()
+{
+    DeleteFileW(PowerJournalPath().c_str());
+}
 
 /* Full path of an installed RobloxPlayerBeta.exe for UserGpuPreferences
    (the key works best with a full path). First match under
@@ -186,9 +251,35 @@ std::wstring FindRobloxPlayerExe()
 
 } /* namespace */
 
+void TweaksPowerRecoverStale()
+{
+    GUID previous{};
+    if (!LoadPowerJournal(previous)) return;
+
+    HMODULE powr = LoadLibraryW(L"PowrProf.dll");
+    auto get = powr ? GetPowerGetActiveScheme(powr) : nullptr;
+    auto set = powr ? GetPowerSetActiveScheme(powr) : nullptr;
+    GUID* current = nullptr;
+    bool owned = get && get(0, &current) == 0 && current &&
+                 IsTasxPowerScheme(*current);
+    if (current) LocalFree(current);
+    if (get && !owned) {
+        /* A user/Windows change after a hard kill supersedes our journal.
+           Never overwrite that external choice on the next launch. */
+        DeletePowerJournal();
+        LOGI("[TASX] Stale power journal ignored: active scheme was changed externally");
+    } else if (set && owned && set(0, &previous) == 0) {
+        DeletePowerJournal();
+        LOGW("[TASX] Recovered power scheme left by an interrupted previous run");
+    } else {
+        LOGE("[TASX] Could not recover the previous power scheme; journal kept for the next startup");
+    }
+    if (powr) FreeLibrary(powr);
+}
+
 void TweaksApplyOneShot()
 {
-    if (!config_get_bool("TASX", "ApplyTweaks", 1)) return;
+    if (!config_get_bool("TASX", "ApplyTweaks", 0)) return;
 
     bool elevated = tasx_is_elevated() != 0;
     if (!elevated && LogRateLimit("tweaks-hklm-skip", 3600))
@@ -261,7 +352,7 @@ void TweaksApplyOneShot()
 
 void TweaksPowerEnter()
 {
-    if (!config_get_bool("TASX", "PowerPlan", 1)) return;
+    if (!config_get_bool("TASX", "PowerPlan", 0)) return;
     if (g_prevSaved) return;
 
     HMODULE powr = LoadLibraryW(L"PowrProf.dll");
@@ -274,11 +365,29 @@ void TweaksPowerEnter()
         if (get(0, &cur) == 0 && cur) {
             g_prevScheme = *cur;
             LocalFree(cur);
+            /* Persist before changing the global scheme. If TASX is killed
+               between these operations, the next startup can recover it. */
+            if (!SavePowerJournal(g_prevScheme)) {
+                LOGE("[TASX] Power scheme journal could not be written; refusing to change the global power plan");
+                FreeLibrary(powr);
+                return;
+            }
             g_prevSaved = true;
         }
 
-        if (set(0, &kUltimatePerfGuid) != 0)
-            set(0, &kHighPerfGuid);
+        g_appliedScheme = kUltimatePerfGuid;
+        bool changed = set(0, &kUltimatePerfGuid) == 0;
+        if (!changed) {
+            g_appliedScheme = kHighPerfGuid;
+            changed = set(0, &kHighPerfGuid) == 0;
+        }
+        if (!changed) {
+            LOGW("[TASX] Power scheme change failed; previous scheme retained");
+            DeletePowerJournal();
+            g_prevSaved = false;
+            FreeLibrary(powr);
+            return;
+        }
 
         LOGI("[TASX] Power scheme -> Ultimate/High performance");
     }
@@ -289,14 +398,28 @@ void TweaksPowerEnter()
 void TweaksPowerExit()
 {
     if (!g_prevSaved) return;
-    g_prevSaved = false;
 
     HMODULE powr = LoadLibraryW(L"PowrProf.dll");
     if (!powr) return;
 
+    auto get = GetPowerGetActiveScheme(powr);
     auto set = GetPowerSetActiveScheme(powr);
-    if (set && set(0, &g_prevScheme) == 0)
+    GUID* current = nullptr;
+    bool stillOwned = get && get(0, &current) == 0 && current &&
+                      GuidEqual(*current, g_appliedScheme);
+    if (current) LocalFree(current);
+
+    if (get && !stillOwned) {
+        DeletePowerJournal();
+        g_prevSaved = false;
+        LOGI("[TASX] Power scheme left unchanged: active scheme was changed externally");
+    } else if (set && stillOwned && set(0, &g_prevScheme) == 0) {
+        DeletePowerJournal();
+        g_prevSaved = false;
         LOGI("[TASX] Power scheme restored");
+    } else {
+        LOGE("[TASX] Power scheme restore failed; journal retained for next startup");
+    }
 
     FreeLibrary(powr);
 }

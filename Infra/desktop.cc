@@ -73,3 +73,8 @@ void DesktopCheckClient(DWORD pid, HANDLE hProc)
              pid, gdi, (unsigned long)GdiQuota(), usr, (unsigned long)UserQuota());
     }
 }
+
+void DesktopForgetClient(DWORD pid)
+{
+    g_lastWarnMs.erase(pid);
+}

@@ -85,7 +85,7 @@ void tasx_log_shutdown(void);
 
 /* Create a Job Object. killOnClose != 0 sets
    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (farm dies with the agent —
-   TASX.ini KillOnAgentExit, default 1). Returns NULL on failure. */
+   TASX.ini KillOnAgentExit, default 0). Returns NULL on failure. */
 HANDLE tasx_job_create_ex(int killOnClose);
 
 /* tasx_job_create_ex(1). */

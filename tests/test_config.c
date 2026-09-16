@@ -71,6 +71,11 @@ void config_test_suite(void)
     CHECK_EQ_I("bool 2 -> default", config_get_bool("TASX", "2Flag", 7), 7);
     CHECK_EQ_I("bool garbage -> default", config_get_bool("TASX", "GarbageFlag", 7), 7);
 
+    WriteBytes(dir, "[TASX]\nMalformedOn=oops\nMalformedTrue=trueish\n");
+    config_reload(dir);
+    CHECK_EQ_I("malformed bool oops -> default", config_get_bool("TASX", "MalformedOn", 7), 7);
+    CHECK_EQ_I("malformed bool trueish -> default", config_get_bool("TASX", "MalformedTrue", 7), 7);
+
     /* 4. Integers. */
     WriteBytes(dir,
                "[TASX]\n"
@@ -81,6 +86,14 @@ void config_test_suite(void)
     CHECK_EQ_I("int plus", config_get_int("TASX", "Plus", 0), 42);
     CHECK_EQ_I("int junk prefix", config_get_int("TASX", "Junk", 0), 15);
     CHECK_EQ_I("int empty -> default", config_get_int("TASX", "Empty", 9), 9);
+
+    WriteBytes(dir,
+               "[TASX]\n"
+               "Huge=999999999999999999999\n"
+               "NegHuge=-999999999999999999999\n");
+    config_reload(dir);
+    CHECK_EQ_I("int huge saturates high", config_get_int("TASX", "Huge", 0), 2147483647);
+    CHECK_EQ_I("int huge saturates low", config_get_int("TASX", "NegHuge", 0), (-2147483647 - 1));
 
     /* 5. Case-insensitive section/key, key outside section ignored. */
     WriteBytes(dir,
@@ -127,10 +140,10 @@ void config_test_suite(void)
     WriteBytes(dir, "x=y\n");
     CHECK_EQ_I("create_default refuses existing", config_create_default(dir), 0);
 
-    /* 10. Missing file -> defaults, no crash. */
+    /* 10. Missing file during reload -> last-known-good config, no crash. */
     config_reload("tests/.build/does_not_exist.ini");
-    CHECK_EQ_S("missing file default", config_get_str("TASX", "Whatever", "dflt"), "dflt");
-    CHECK_EQ_I("missing file not loaded", config_loaded(), 0);
+    CHECK_EQ_S("missing file keeps last config", config_get_str("Sec", "A", "dflt"), "1");
+    CHECK_EQ_I("missing file keeps loaded state", config_loaded(), 1);
 
     /* 11. Oversized file: the table is capped and the truncation is
        REPORTED (config_truncated) instead of silently dropping keys. */
@@ -155,4 +168,24 @@ void config_test_suite(void)
     config_reload(dir);
     CHECK_EQ_I("truncation flag cleared", config_truncated(), 0);
     CHECK_EQ_I("small file loaded", config_get_int("TASX", "Small", 0), 1);
+
+    /* 13. Generated defaults must fail safe for unattended 24/7 operation:
+       no trimming, no client-killing job limit, and no persistent global
+       power/registry changes unless the operator opts in. */
+    {
+        const char* generated = "tests/.build/generated-default.ini";
+        remove(generated);
+        CHECK_EQ_I("safe defaults created", config_create_default(generated), 1);
+        config_reload(generated);
+        CHECK_EQ_I("default trimming disabled", config_get_bool("TASX", "TrimUnfocused", 1), 0);
+        CHECK_EQ_I("default memory cap disabled", config_get_int("TASX", "JobMemoryCapMB", -1), 0);
+        CHECK_EQ_I("default job close kill disabled", config_get_bool("TASX", "KillOnAgentExit", 1), 0);
+        CHECK_EQ_I("default power plan disabled", config_get_bool("TASX", "PowerPlan", 1), 0);
+        CHECK_EQ_I("default registry tweaks disabled", config_get_bool("TASX", "ApplyTweaks", 1), 0);
+        CHECK_EQ_I("default global cleaner disabled", config_get_bool("TASX", "SystemCleaner", 1), 0);
+        CHECK_EQ_I("default standby purge disabled", config_get_bool("TASX", "PurgeStandbyOnLaunch", 1), 0);
+        CHECK_EQ_I("default page-in is manual", config_get_int("TASX", "PageInIntervalSec", -1), 0);
+        CHECK_EQ_I("default FPS remains capped", config_get_bool("Roblox", "UncapFps", 1), 0);
+        remove(generated);
+    }
 }

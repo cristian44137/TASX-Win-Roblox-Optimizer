@@ -9,13 +9,16 @@ extern "C" {
 void config_load(const char* iniPath);
 
 /* Drops all cached entries and re-reads the file (hot-reload).
-   Missing file keeps previous defaults for absent keys. */
+   If the file cannot be opened during an atomic replace, the last valid
+   configuration remains active. */
 void config_reload(const char* iniPath);
 
 /* Fills out with "<exe dir>\TASX.ini". */
 void config_default_path(char* out, int outLen);
 
-/* All getters are read-only and safe from any thread after config_load. */
+/* All getters are read-only and safe from any thread after config_load.
+   Existing strings are copied into thread-local storage, so hot-reload cannot
+   invalidate a returned value during the current operation. */
 int         config_get_int(const char* section, const char* key, int defVal);
 const char* config_get_str(const char* section, const char* key, const char* defVal);
 int         config_get_bool(const char* section, const char* key, int defVal);

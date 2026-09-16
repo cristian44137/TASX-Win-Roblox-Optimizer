@@ -6,30 +6,42 @@ CXXFLAGS = -std=c++23 -O2 -m64 -static -Wall -Wextra
 
 LDFLAGS = -lwbemuuid -lpsapi -lpowrprof -luser32 -lkernel32 -lole32 -loleaut32 -luuid -lcomctl32 -ladvapi32 -liphlpapi
 
-HEADERS = Infra/CPU.h Infra/WMI.h Infra/trimmer.h Infra/winhook.h \
+HEADERS = Infra/CPU.h Infra/WMI.h Infra/trimmer.h Infra/metrics.h Infra/winhook.h \
           Infra/config.h Infra/ntsys.h Infra/tweaks.h Infra/fflags.h \
           Infra/jobs.h Infra/stats.h Infra/audio.h Infra/warm.h \
           Infra/desktop.h Infra/netcache.h Infra/hotkey.h Infra/respawn.h \
           Infra/log.h Infra/lograte.h
 
-OBJS = master.o CPU.o WMI.o trimmer.o winhook.o hotkey.o config.o ntsys.o tweaks.o fflags.o jobs.o stats.o audio.o warm.o desktop.o netcache.o respawn.o
+COMMON_OBJS = CPU.o WMI.o trimmer.o metrics.o winhook.o hotkey.o config.o ntsys.o tweaks.o fflags.o jobs.o stats.o audio.o warm.o desktop.o netcache.o respawn.o
 RES  = tasx.res
 
 all: TASX.exe
 
+# Visible diagnostic build. Keep it separate from the headless release so a
+# user can watch the live agent log without changing the scheduled-task binary.
+debug: TASX-debug.exe
+
+TASX-debug.exe: master_console.o $(COMMON_OBJS) $(RES)
+	$(CXX) $(CXXFLAGS) master_console.o $(COMMON_OBJS) $(RES) -o TASX-debug.exe $(LDFLAGS)
+
 # Console build for debugging (stdout visible)
-TASX.exe: $(OBJS) $(RES)
-	$(CXX) $(CXXFLAGS) -DTASX_CONSOLE $(OBJS) $(RES) -o TASX.exe $(LDFLAGS)
+TASX.exe: master_console.o $(COMMON_OBJS) $(RES)
+	$(CXX) $(CXXFLAGS) master_console.o $(COMMON_OBJS) $(RES) -o TASX.exe $(LDFLAGS)
 
 tasx.res: tasx.rc tasx.manifest
 	windres tasx.rc -O coff -o tasx.res
 
-# Silent GUI-subsystem build shipped with ScheduledTaskInstaller.bat
-windows: $(OBJS) $(RES)
-	$(CXX) $(CXXFLAGS) -DTASX_GUI -mwindows $(OBJS) $(RES) -o TASX.exe $(LDFLAGS)
+# Headless Windows-subsystem build shipped with ScheduledTaskInstaller.bat.
+# It intentionally has no console or status window: the scheduled task runs
+# the optimizer in the background and the single-instance mutex is the guard.
+windows: master_gui.o $(COMMON_OBJS) $(RES)
+	$(CXX) $(CXXFLAGS) -mwindows master_gui.o $(COMMON_OBJS) $(RES) -o TASX.exe $(LDFLAGS)
 
-master.o: Infra/master.cpp $(HEADERS)
-	$(CXX) $(CXXFLAGS) -c Infra/master.cpp -o master.o
+master_console.o: Infra/master.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) -DTASX_CONSOLE -c Infra/master.cpp -o master_console.o
+
+master_gui.o: Infra/master.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) -DTASX_GUI -c Infra/master.cpp -o master_gui.o
 
 CPU.o: Infra/CPU.cc Infra/CPU.h Infra/config.h Infra/ntsys.h
 	$(CXX) $(CXXFLAGS) -c Infra/CPU.cc -o CPU.o
@@ -37,8 +49,11 @@ CPU.o: Infra/CPU.cc Infra/CPU.h Infra/config.h Infra/ntsys.h
 WMI.o: Infra/WMI.cc Infra/WMI.h
 	$(CXX) $(CXXFLAGS) -c Infra/WMI.cc -o WMI.o
 
-trimmer.o: Infra/trimmer.cc Infra/trimmer.h Infra/config.h Infra/ntsys.h Infra/stats.h
+trimmer.o: Infra/trimmer.cc Infra/trimmer.h Infra/metrics.h Infra/config.h Infra/ntsys.h Infra/stats.h
 	$(CXX) $(CXXFLAGS) -c Infra/trimmer.cc -o trimmer.o
+
+metrics.o: Infra/metrics.cc Infra/metrics.h Infra/trimmer.h Infra/stats.h Infra/config.h
+	$(CXX) $(CXXFLAGS) -c Infra/metrics.cc -o metrics.o
 
 winhook.o: Infra/winhook.cc Infra/winhook.h
 	$(CXX) $(CXXFLAGS) -c Infra/winhook.cc -o winhook.o
@@ -81,11 +96,9 @@ fflags.o: Infra/fflags.cc Infra/fflags.h Infra/config.h
 	$(CXX) $(CXXFLAGS) -c Infra/fflags.cc -o fflags.o
 
 clean:
-	@echo [clean] removing build outputs (works under cmd.exe and sh)
-	-@rm -f TASX.exe *.o *.res
-	-@del /q TASX.exe *.o *.res
-	-@rm -rf tests/.build
-	-@rmdir /s /q tests/.build
+	@echo [clean] removing build outputs
+	-@cmd /c "del /q TASX.exe *.o *.res 2>nul"
+	-@cmd /c "if exist tests\.build rmdir /s /q tests\.build"
 
 # --- Unit tests (self-contained, no external dependencies) ------------
 
@@ -111,5 +124,5 @@ tests/.build/test_config.exe: tests/run_tests.c tests/test_config.c Infra/config
 tests/.build/test_respawn.exe: tests/test_respawn.cpp Infra/respawn.cc Infra/respawn.h Infra/config.c Infra/config.h Infra/ntsys.c Infra/ntsys.h | tests/.build
 	$(CC) $(CFLAGS) -IInfra -c Infra/config.c -o tests/.build/config.o
 	$(CC) $(CFLAGS) -IInfra -c Infra/ntsys.c -o tests/.build/ntsys.o
-	$(CXX) $(CXXFLAGS) -IInfra -c Infra/respawn.cc -o tests/.build/respawn.o
-	$(CXX) $(CXXFLAGS) -IInfra tests/test_respawn.cpp tests/.build/respawn.o tests/.build/config.o tests/.build/ntsys.o -o $@ $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) -DTASX_TEST -IInfra -c Infra/respawn.cc -o tests/.build/respawn.o
+	$(CXX) $(CXXFLAGS) -DTASX_TEST -IInfra tests/test_respawn.cpp tests/.build/respawn.o tests/.build/config.o tests/.build/ntsys.o -o $@ $(LDFLAGS)

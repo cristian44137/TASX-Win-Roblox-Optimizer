@@ -14,6 +14,7 @@
 
 static IWbemLocator* g_pLoc = nullptr;
 static IWbemServices* g_pSvc = nullptr;
+static bool g_comInitialized = false;
 
 /* Drain for shutdown: _wmishutdown waits until no Indicate is in flight
    before releasing the sink (otherwise Release/CoUninitialize races a
@@ -26,6 +27,16 @@ static void CloseDrainEvent()
     if (g_drainEvent) {
         CloseHandle(g_drainEvent);
         g_drainEvent = nullptr;
+    }
+}
+
+static void DrainIndications()
+{
+    if (g_drainEvent) {
+        WaitForSingleObject(g_drainEvent, INFINITE);
+    } else {
+        while (InterlockedCompareExchange(&g_indicateActive, 0, 0) != 0)
+            Sleep(1);
     }
 }
 
@@ -62,18 +73,31 @@ public:
         InterlockedIncrement(&g_indicateActive);
         if (g_drainEvent)
             ResetEvent(g_drainEvent);
+        struct ActiveCallbackGuard {
+            ~ActiveCallbackGuard()
+            {
+                if (InterlockedDecrement(&g_indicateActive) == 0 && g_drainEvent)
+                    SetEvent(g_drainEvent);
+            }
+        } guard;
+
+        try {
+        if (lObjectCount <= 0 || !apObjArray)
+            return WBEM_S_NO_ERROR;
         for (LONG i = 0; i < lObjectCount; i++) {
+            if (!apObjArray[i]) continue;
             /* Class kind first (cheap single property). */
             VARIANT vtClass;
             VariantInit(&vtClass);
             bool created = false;
             bool known = false;
-            if (SUCCEEDED(apObjArray[i]->Get(_bstr_t(L"__Class"), 0, &vtClass, 0, 0))) {
+            if (SUCCEEDED(apObjArray[i]->Get(_bstr_t(L"__Class"), 0, &vtClass, 0, 0)) &&
+                vtClass.vt == VT_BSTR) {
                 std::wstring eventClass = vtClass.bstrVal ? vtClass.bstrVal : L"";
                 created = (eventClass == L"__InstanceCreationEvent");
                 known = created || (eventClass == L"__InstanceDeletionEvent");
-                VariantClear(&vtClass);
             }
+            VariantClear(&vtClass);
             if (!known) continue;
 
             /* Pull the PID out of the embedded TargetInstance — the event
@@ -89,19 +113,23 @@ public:
                 VARIANT vtPid;
                 VariantInit(&vtPid);
                 if (SUCCEEDED(tgt->Get(_bstr_t(L"Handle"), 0, &vtPid, 0, 0)) &&
-                    vtPid.bstrVal)
-                {
+                    vtPid.vt == VT_BSTR && vtPid.bstrVal) {
                     pid = (DWORD)wcstoul(vtPid.bstrVal, nullptr, 10);
-                    VariantClear(&vtPid);
                 }
+                VariantClear(&vtPid);
             }
             VariantClear(&vtTarget);
 
             if (pid)
                 TasxNotifyProcess(pid, created ? 1 : 0);
         }
-        if (InterlockedDecrement(&g_indicateActive) == 0 && g_drainEvent)
-            SetEvent(g_drainEvent);
+        } catch (...) {
+            /* A bad/oversized WMI payload or allocation failure must not
+               escape through COM. The event is safe to drop; the snapshot
+               discovery fallback will find the process on the next pass. */
+            LOGE("[WMI] Exception while processing an event; event dropped safely");
+            return WBEM_E_FAILED;
+        }
         return WBEM_S_NO_ERROR;
     }
 
@@ -130,6 +158,7 @@ bool _wmimon() {
         LOGE("[WMI] CoInitializeEx failed. hr = 0x%08lX", (unsigned long)hr);
         return false;
     }
+    g_comInitialized = true;
 
     hr = CoInitializeSecurity(
         NULL,
@@ -142,9 +171,10 @@ bool _wmimon() {
         EOAC_NONE,
         NULL
     );
-    if (FAILED(hr)) {
+    if (FAILED(hr) && hr != RPC_E_TOO_LATE) {
         LOGE("[WMI] CoInitializeSecurity failed. hr = 0x%08lX", (unsigned long)hr);
         CoUninitialize();
+        g_comInitialized = false;
         return false;
     }
 
@@ -157,6 +187,7 @@ bool _wmimon() {
     if (FAILED(hr)) {
         LOGE("[WMI] CoCreateInstance failed. hr = 0x%08lX", (unsigned long)hr);
         CoUninitialize();
+        g_comInitialized = false;
         return false;
     }
 
@@ -175,6 +206,7 @@ bool _wmimon() {
         g_pLoc->Release();
         g_pLoc = nullptr;
         CoUninitialize();
+        g_comInitialized = false;
         return false;
     }
 
@@ -195,6 +227,7 @@ bool _wmimon() {
         g_pLoc->Release();
         g_pLoc = nullptr;
         CoUninitialize();
+        g_comInitialized = false;
         return false;
     }
 
@@ -219,6 +252,10 @@ bool _wmimon() {
     if (FAILED(hr)) {
         LOGE("[WMI] ExecNotificationQueryAsync (creation) failed. hr = 0x%08lX",
              (unsigned long)hr);
+        /* Keep the partial-init path identical to normal shutdown. Even
+           though this query normally has no callback yet, waiting here makes
+           the ownership rule correct if the provider completed concurrently. */
+        DrainIndications();
         g_pSink->Release();
         g_pSink = nullptr;
         CloseDrainEvent();
@@ -227,6 +264,7 @@ bool _wmimon() {
         g_pLoc->Release();
         g_pLoc = nullptr;
         CoUninitialize();
+        g_comInitialized = false;
         return false;
     }
 
@@ -244,6 +282,7 @@ bool _wmimon() {
         LOGE("[WMI] ExecNotificationQueryAsync (deletion) failed. hr = 0x%08lX",
              (unsigned long)hr);
         g_pSvc->CancelAsyncCall(g_pSink);
+        DrainIndications();
         g_pSink->Release();
         g_pSink = nullptr;
         CloseDrainEvent();
@@ -252,6 +291,7 @@ bool _wmimon() {
         g_pLoc->Release();
         g_pLoc = nullptr;
         CoUninitialize();
+        g_comInitialized = false;
         return false;
     }
 
@@ -264,12 +304,12 @@ void _wmishutdown() {
         g_pSvc->CancelAsyncCall(g_pSink);
     }
 
-    /* Drain: CancelAsyncCall stops NEW callbacks; wait (bounded) for any
-       in-flight Indicate to finish before touching the sink. */
-    if (g_drainEvent) {
-        WaitForSingleObject(g_drainEvent, 2000);
-        CloseDrainEvent();
-    }
+    /* Drain: CancelAsyncCall stops NEW callbacks; wait for every in-flight
+       Indicate to finish before touching the sink. A bounded wait followed by
+       Release is a use-after-free risk if WMI is stalled under load, so an
+       orderly shutdown intentionally waits indefinitely here. */
+    DrainIndications();
+    CloseDrainEvent();
 
     if (g_pSink) {
         g_pSink->Release();
@@ -286,5 +326,8 @@ void _wmishutdown() {
         g_pLoc = nullptr;
     }
 
-    CoUninitialize();
+    if (g_comInitialized) {
+        CoUninitialize();
+        g_comInitialized = false;
+    }
 }

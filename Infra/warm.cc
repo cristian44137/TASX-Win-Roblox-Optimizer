@@ -5,6 +5,8 @@
 #include "lograte.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -15,6 +17,32 @@ namespace {
 
 std::mutex g_primedPathsMtx;
 std::unordered_set<std::wstring> g_primedPaths; // once per version dir
+std::mutex g_workersMtx;
+std::condition_variable g_workersCv;
+size_t g_activeWorkers = 0;
+bool g_shuttingDown = false;
+constexpr size_t kMaxWarmWorkers = 2;
+
+struct WarmWorkerGuard {
+    ~WarmWorkerGuard()
+    {
+        std::lock_guard<std::mutex> lock(g_workersMtx);
+        if (g_activeWorkers > 0) --g_activeWorkers;
+        g_workersCv.notify_all();
+    }
+};
+
+struct PrimedPathReservation {
+    std::wstring path;
+    bool committed = false;
+
+    ~PrimedPathReservation()
+    {
+        if (committed) return;
+        std::lock_guard<std::mutex> lock(g_primedPathsMtx);
+        g_primedPaths.erase(path);
+    }
+};
 
 typedef BOOL (WINAPI *PrefetchVirtualMemoryFn)(HANDLE hProcess,
                                                ULONG_PTR numberOfEntries,
@@ -29,13 +57,12 @@ struct RANGE {
 PrefetchVirtualMemoryFn GetPrefetchFn()
 {
     static PrefetchVirtualMemoryFn fn = nullptr;
-    static int resolved = 0;
-    if (!resolved) {
+    static std::once_flag once;
+    std::call_once(once, [&]() {
         HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
         if (k32)
             fn = TasxProcFn<PrefetchVirtualMemoryFn>(k32, "PrefetchVirtualMemory");
-        resolved = 1;
-    }
+    });
     return fn; /* null on Win7 -> caller falls back to sequential reads */
 }
 
@@ -59,6 +86,7 @@ bool WarmFile(const std::wstring& path, ULONGLONG& budget)
     ULONGLONG bytes = (ULONGLONG)size.QuadPart;
     if (bytes > budget) { CloseHandle(hFile); return false; }
 
+    bool warmed = false;
     HANDLE hMap = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
     if (hMap) {
         void* view = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
@@ -66,23 +94,36 @@ bool WarmFile(const std::wstring& path, ULONGLONG& budget)
             PrefetchVirtualMemoryFn fn = GetPrefetchFn();
             if (fn) {
                 RANGE r{ view, (SIZE_T)bytes };
-                fn(GetCurrentProcess(), 1, &r, 0);
-            }
-            else {
-                /* Win7 fallback: sequential read warms the same cache. */
-                char sink[1 << 20];
-                DWORD got = 0;
-                while (ReadFile(hFile, sink, sizeof(sink), &got, nullptr) && got)
-                    ;
+                warmed = fn(GetCurrentProcess(), 1, &r, 0) != FALSE;
             }
             UnmapViewOfFile(view);
         }
         CloseHandle(hMap);
     }
 
-    budget -= bytes;
+    if (!warmed) {
+        /* PrefetchVirtualMemory is optional and mapping can fail transiently.
+           Sequentially touch the file as a last-resort fallback, and count
+           it as success only when the complete read finishes without an API
+           error. This keeps the reservation/budget accounting honest. */
+        LARGE_INTEGER zero{};
+        BOOL readOk = SetFilePointerEx(hFile, zero, nullptr, FILE_BEGIN);
+        char sink[1 << 20];
+        DWORD got = 0;
+        while (readOk) {
+            if (!ReadFile(hFile, sink, sizeof(sink), &got, nullptr)) {
+                readOk = FALSE;
+                break;
+            }
+            if (!got) break;
+        }
+        warmed = readOk != FALSE;
+    }
+
+    if (warmed)
+        budget -= bytes;
     CloseHandle(hFile);
-    return true;
+    return warmed;
 }
 
 int FilePriority(const wchar_t* name)
@@ -101,8 +142,20 @@ void WarmClientFilesAsync(DWORD pid)
     if (!config_get_bool("TASX", "WarmClientFiles", 1)) return;
     /* Once-per-version is inherent (g_primedPaths); no config key. */
 
-    // Cache primed paths globally — only prime once per version directory
-    std::thread([pid]() {
+    std::lock_guard<std::mutex> lifecycleLock(g_workersMtx);
+    if (g_shuttingDown) return;
+    if (g_activeWorkers >= kMaxWarmWorkers) {
+        /* Warming is an optional cache optimization.  Never let a spawn
+           burst turn it into an unbounded disk-I/O fan-out. */
+        return;
+    }
+
+    // Cache primed paths globally — only prime once per version directory.
+    ++g_activeWorkers;
+    try {
+        std::thread([pid]() {
+        WarmWorkerGuard workerGuard;
+        try {
         HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
         if (!h) return;
 
@@ -127,8 +180,27 @@ void WarmClientFilesAsync(DWORD pid)
             if (g_primedPaths.count(dir)) {
                 return;  // already primed this version
             }
+            /* Version directories accumulate over months. First remove
+               entries for uninstalled versions; only refuse a new
+               reservation when the live set is still at the hard ceiling.
+               This keeps the optional optimization bounded without causing a
+               bulk re-warm storm. */
+            if (g_primedPaths.size() >= 1024) {
+                for (auto it = g_primedPaths.begin(); it != g_primedPaths.end();) {
+                    if (GetFileAttributesW(it->c_str()) == INVALID_FILE_ATTRIBUTES)
+                        it = g_primedPaths.erase(it);
+                    else
+                        ++it;
+                }
+            }
+            if (g_primedPaths.size() >= 1024) {
+                if (LogRateLimit("warm-path-cap", 3600))
+                    LOGW("[Warm] Version-directory cache reached its safety cap; new versions will be skipped");
+                return;
+            }
             g_primedPaths.insert(dir);
         }
+        PrimedPathReservation reservation{dir};
 
         ULONGLONG budget =
             (ULONGLONG)std::max(0, config_get_int("TASX", "WarmMaxMB", 256)) << 20;
@@ -162,6 +234,7 @@ void WarmClientFilesAsync(DWORD pid)
         }
 
         if (warmed) {
+            reservation.committed = true;
             if (LogRateLimit("warm-primed", 10)) {
                 char narrow[MAX_PATH];
                 size_t conv = 0;
@@ -170,11 +243,27 @@ void WarmClientFilesAsync(DWORD pid)
                      warmed >> 20, narrow);
             }
         }
-        else {
-            // Warm pass failed (e.g. budget): release the reservation so a
-            // later client of the same version can retry.
-            std::lock_guard<std::mutex> lock(g_primedPathsMtx);
-            g_primedPaths.erase(dir);
+        /* On failure (including an empty budget or missing directory), the
+           reservation guard removes the path so a later client can retry. */
+        } catch (...) {
+            /* A malformed install, allocation failure, or an API edge case
+               must never escape a detached worker and terminate TASX. */
+            if (LogRateLimit("warm-worker-fail", 60))
+                LOGW("[Warm] Worker failed; continuing without file warming");
         }
-    }).detach();
+        }).detach();
+    } catch (...) {
+        --g_activeWorkers;
+        /* Worker creation is optional. A failed warm task must never affect
+           client ownership or bring down the long-running agent. */
+        if (LogRateLimit("warm-thread-fail", 60))
+            LOGW("[Warm] Worker creation failed; continuing without file warming");
+    }
+}
+
+void WarmShutdown()
+{
+    std::unique_lock<std::mutex> lock(g_workersMtx);
+    g_shuttingDown = true;
+    g_workersCv.wait(lock, [] { return g_activeWorkers == 0; });
 }

@@ -1,8 +1,10 @@
 ﻿#define NOMINMAX
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -10,6 +12,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 
 #include <windows.h>
 #include <psapi.h>
@@ -19,6 +22,7 @@
 #include "WMI.h"
 #include "CPU.h"
 #include "trimmer.h"
+#include "metrics.h"
 #include "winhook.h"
 #include "hotkey.h"
 #include "config.h"
@@ -56,12 +60,57 @@ struct Event {
 std::mutex g_queueMutex;
 std::condition_variable g_queueCv;
 std::deque<Event> g_queue;
+constexpr size_t kMaxEventQueue = 16384;
+std::atomic<bool> g_reconcileNeeded{false};
+std::atomic<unsigned long> g_droppedQueueEvents{0};
 
-void PushEvent(Event ev)
+void PushEvent(Event ev) noexcept
 {
-    {
+    try {
         std::lock_guard<std::mutex> lock(g_queueMutex);
+        /* Focus, low-memory and config notifications are level-triggered:
+           one pending notification is enough, and callbacks can otherwise
+           outrun the single-consumer loop during a busy desktop or a reload
+           storm. */
+        const bool coalescible = ev.kind == Ev::Focus ||
+                                 ev.kind == Ev::LowMem ||
+                                 ev.kind == Ev::ConfigChanged;
+        if (coalescible) {
+            for (auto it = g_queue.rbegin(); it != g_queue.rend(); ++it) {
+                if (it->kind == ev.kind)
+                    return;
+            }
+        } else if (ev.kind == Ev::RobloxCreated ||
+                   ev.kind == Ev::RobloxExited ||
+                   ev.kind == Ev::JobChild) {
+            /* WMI and the job completion port may both report the same
+               transition. Repeating the same PID/kind is idempotent; retain
+               one pending event instead of allowing a process storm to grow
+               the queue without bound. */
+            for (auto it = g_queue.rbegin(); it != g_queue.rend(); ++it) {
+                if (it->kind == ev.kind && it->pid == ev.pid)
+                    return;
+            }
+        }
+
+        /* A bounded queue is mandatory for a long-lived agent: a broken WMI
+           provider or a callback storm must not turn event backlog into an
+           unbounded heap allocation. Dropped lifecycle events are repaired
+           by a process-table reconciliation on the main thread. */
+        if (g_queue.size() >= kMaxEventQueue) {
+            g_reconcileNeeded.store(true, std::memory_order_release);
+            g_droppedQueueEvents.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
         g_queue.push_back(ev);
+    } catch (...) {
+        /* PushEvent is called from COM, WinEvent, hotkey and IOCP callbacks.
+           Allocation failure must never escape through one of those foreign
+           callback boundaries and terminate TASX. */
+        g_reconcileNeeded.store(true, std::memory_order_release);
+        g_droppedQueueEvents.fetch_add(1, std::memory_order_relaxed);
+        return;
     }
     g_queueCv.notify_one();
 }
@@ -115,8 +164,13 @@ std::unordered_map<DWORD, HANDLE> g_waitHandles; // RegisterWait handles
    threads); dropped silently if the process exits first. */
 std::unordered_map<DWORD, ULONGLONG> g_retryBlocked;
 DWORD g_appliedFocus = 0; /* PID currently running the focused profile */
-bool g_pageInBusy = false;
+std::atomic<bool> g_pageInBusy{false};
+HANDLE g_pageInThread = nullptr;
 ULONGLONG g_lastPageInMs = 0;
+/* FarmBoost (Ctrl+Alt+B): mirrors the flag jobs.cc/trimmer.cc each keep
+   their own copy of (so those modules don't need to depend on master.cpp);
+   this one is only for master's own decisions (logging, startup default). */
+std::atomic<bool> g_farmBoostOn{false};
 WinHook* g_hook = nullptr;
 FarmHotkey* g_hotkey = nullptr;
 HANDLE g_singleInstanceMutex = nullptr;
@@ -128,6 +182,7 @@ volatile LONG g_stop = 0;
 /* Set by the Ctrl handler; wakes the low-memory reactor so shutdown is
    prompt even during a long low-mem cooldown (no more Sleep(cd * 1000)). */
 HANDLE g_stopEvent = nullptr;
+HANDLE g_lowMemThread = nullptr;
 
 ULONGLONG g_lastWsUpdateMs = 0;
 ULONGLONG g_lastCrashSweepMs = 0;
@@ -138,6 +193,24 @@ ULONGLONG g_lastIniCheckMs = 0;
 void ApplyFocusIfChanged();
 void TimerOn();
 void TimerOffIfFarmNoFocus();
+void HandleRobloxExited(DWORD pid);
+void SweepTrackedClients();
+
+void ApplyPerProcessAffinityPolicy()
+{
+    unsigned long long allMask = tasx_get_all_mask();
+    unsigned long long eMask = tasx_get_ecore_mask();
+    if (!allMask) return;
+
+    bool split = g_appliedFocus != 0 &&
+                 config_get_bool("TASX", "DynamicAffinity", 0) &&
+                 !g_farmBoostOn.load() && eMask;
+    for (auto& kv : g_rbxHandles) {
+        DWORD_PTR target = (split && kv.first != g_appliedFocus)
+            ? (DWORD_PTR)eMask : (DWORD_PTR)allMask;
+        SetProcessAffinityMask(kv.second, target);
+    }
+}
 
 BOOL WINAPI CtrlHandler(DWORD type)
 {
@@ -194,6 +267,9 @@ void RegisterProcessWait(DWORD pid, HANDLE hProc)
     if (!RegisterWaitForSingleObject(&hWait, hProc, OnProcessExit,
                                      (PVOID)(ULONG_PTR)pid, INFINITE,
                                      WT_EXECUTEONLYONCE)) {
+        if (LogRateLimit("register-process-wait", 60))
+            LOGW("[TASX] Exit notification registration failed for PID %lu (err %lu); periodic liveness sweep remains active",
+                 pid, (unsigned long)GetLastError());
         return;
     }
     // store for UnregisterWaitEx on clean exit
@@ -255,7 +331,10 @@ void HookClient(DWORD pid)
 
     bool inJob = JobHookProcess(pid, hProc);
     if (inJob) {
-        tasx_process_power_throttling(hProc, 0); // always P+E, no EcoQoS
+        /* Job Object carries affinity/caps only. Apply priority per process
+           so this client can later become HIGH when focused. */
+        CpuApplyFocusProfile(hProc, 0);
+        tasx_process_power_throttling(hProc, 1); // background EcoQoS
         tasx_set_io_priority(hProc, 0);
         tasx_set_memory_priority(hProc, 1);
         LOGI("[TASX] New Roblox instance PID %lu hooked (job-tracked)", pid);
@@ -263,6 +342,14 @@ void HookClient(DWORD pid)
     else {
         CpuApplyFocusProfile(hProc, 0);
         LOGI("[TASX] New Roblox instance PID %lu hooked (per-process fallback)", pid);
+    }
+
+    /* A newly hooked client must receive the current per-process affinity
+       policy even though it was admitted to the all-core shared job. */
+    if (g_appliedFocus && config_get_bool("TASX", "DynamicAffinity", 0) &&
+        !g_farmBoostOn.load()) {
+        unsigned long long eMask = tasx_get_ecore_mask();
+        if (eMask) SetProcessAffinityMask(hProc, (DWORD_PTR)eMask);
     }
 
     StartTrimmer(pid, hProc);
@@ -327,6 +414,8 @@ void ReleaseClient(DWORD pid, bool logExit)
     StopTrimmer(pid);
     TrimmerRemoveWorkingSet(pid);
     JobRelease(pid);
+    DesktopForgetClient(pid);
+    AudioForgetPid(pid);
     CloseHandle(it->second);
     g_rbxHandles.erase(it);
 
@@ -588,6 +677,8 @@ void ApplyFocusIfChanged()
     }
     // dwell satisfied - proceed to apply candidate (which equals isRoblox?pid:0)
 
+    DWORD focusBefore = g_appliedFocus;
+
     // Focus changes use all-cores profile (always P+E)
     if (isRoblox && g_appliedFocus != pid)
     {
@@ -633,82 +724,226 @@ void ApplyFocusIfChanged()
     // FarmBoost counts as focused (farm runs all-cores, rate-cap policy flips).
     static int lastAppliedFocusState = -1;
     int currentState = (g_appliedFocus != 0) ? 1 : 0;
-    if (currentState != lastAppliedFocusState) {
+    if (currentState != lastAppliedFocusState || focusBefore != g_appliedFocus) {
         JobsRefreshDynamic(currentState);
+        ApplyPerProcessAffinityPolicy();
         lastAppliedFocusState = currentState;
     }
 }
 
 /* Page-in hotkey: pull all tracked clients out of pagefile.
    Always keeps P+E affinity; never changes CPU profile or trims. */
-/* Parallel page-in (4 workers) for speed; aggregate stats. */
-struct PageInWorkerCtx {
+/* Parallel page-in with a fixed worker ceiling. The old implementation
+   created one Windows thread per client, so a large farm could turn a
+   manual optimization into a thread/I/O storm. */
+struct PageInClientCtx {
     HANDLE h;
     CpuPageInStats st{};
 };
 
+struct PageInBatchCtx {
+    PageInClientCtx* clients;
+    size_t count;
+    size_t first;
+    size_t stride;
+};
+
 static DWORD WINAPI PageInWorker(LPVOID arg)
 {
-    auto* ctx = static_cast<PageInWorkerCtx*>(arg);
-    CpuPageInProcess(ctx->h, &ctx->st);
+    auto* batch = static_cast<PageInBatchCtx*>(arg);
+    try {
+        for (size_t i = batch->first; i < batch->count; i += batch->stride)
+            CpuPageInProcess(batch->clients[i].h, &batch->clients[i].st);
+    } catch (const std::exception& ex) {
+        LOGW("[TASX] Page-in worker exception: %s; remaining clients in this batch skipped",
+             ex.what());
+    } catch (...) {
+        LOGW("[TASX] Page-in worker exception; remaining clients in this batch skipped");
+    }
     return 0;
 }
 
-void PageInFarm()
-{
-    if (g_pageInBusy) {
-        LOGI("[TASX] Page-in already running (hotkey ignored)");
-        return;
+/* Handoff payload from the main thread to the page-in worker thread. Every
+   HANDLE in here is TASX's own duplicate, owned solely by the worker - the
+   worker closes every one of them, so it never touches g_rbxHandles or
+   anything else the main thread owns. */
+struct PageInJob {
+    std::vector<std::pair<DWORD, HANDLE>> clients;
+    ~PageInJob()
+    {
+        for (auto& client : clients) {
+            if (client.second) {
+                CloseHandle(client.second);
+                client.second = nullptr;
+            }
+        }
     }
-    g_pageInBusy = true;
-    TrimmerSetPageInPause(1);
+};
+
+struct PageInStateGuard {
+    ~PageInStateGuard()
+    {
+        TrimmerSetPageInPause(0);
+        g_pageInBusy.store(false);
+    }
+};
+
+/* Runs entirely off the main thread: this is the part that used to block
+   the event loop. Cleans up after itself (closes duplicated handles,
+   un-pauses the trimmer, clears g_pageInBusy).  The thread handle is retained
+   and joined during teardown. */
+static DWORD WINAPI PageInFarmWorkerMain(LPVOID arg)
+{
+    std::unique_ptr<PageInJob> job(static_cast<PageInJob*>(arg));
+    PageInStateGuard stateGuard;
+    try {
     ULONGLONG t0 = GetTickCount64();
 
-    std::vector<std::pair<DWORD, HANDLE>> clients;
-    for (auto& kv : g_rbxHandles) clients.push_back({kv.first, kv.second});
+    std::vector<PageInClientCtx> ctxs;
+    ctxs.reserve(job->clients.size());
+    for (auto& p : job->clients) ctxs.push_back({p.second, {}});
 
-    std::vector<PageInWorkerCtx> ctxs; ctxs.reserve(clients.size());
-    std::vector<HANDLE> threads; threads.reserve(clients.size());
-    for (auto& p : clients) {
-        HANDLE dup = nullptr;
-        DuplicateHandle(GetCurrentProcess(), p.second, GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS);
-        ctxs.push_back({dup ? dup : p.second, {}});
-    }
-
-    for (size_t i = 0; i < ctxs.size(); ++i) {
-        HANDLE th = CreateThread(nullptr, 0, PageInWorker, &ctxs[i], 0, nullptr);
+    constexpr size_t kMaxPageInWorkers = 4;
+    const size_t workerCount = std::min(kMaxPageInWorkers, ctxs.size());
+    std::vector<PageInBatchCtx> batches;
+    batches.reserve(workerCount);
+    std::vector<HANDLE> threads;
+    threads.reserve(workerCount);
+    for (size_t i = 0; i < workerCount; ++i) {
+        batches.push_back({ctxs.data(), ctxs.size(), i, workerCount});
+        HANDLE th = CreateThread(nullptr, 0, PageInWorker, &batches.back(), 0, nullptr);
         if (th) threads.push_back(th);
     }
-
-    for (HANDLE th : threads) { WaitForSingleObject(th, 60000); CloseHandle(th); }
+    for (HANDLE th : threads) {
+        /* CpuPageInProcess owns the duplicated handle through this job.  Do
+           not time out and then destroy the worker context: that would leave
+           a still-running thread with a dangling ctx pointer. */
+        WaitForSingleObject(th, INFINITE);
+        CloseHandle(th);
+    }
 
     unsigned clientsDone = 0;
     unsigned long long totalAttempted = 0, totalTouched = 0, totalFailed = 0, totalBytes = 0;
-    for (size_t i = 0; i < clients.size(); ++i) {
-        if (ctxs[i].h) {
-            clientsDone++;
-            totalAttempted += ctxs[i].st.attemptedPages;
-            totalTouched += ctxs[i].st.touchedPages;
-            totalFailed += ctxs[i].st.failedPages;
-            totalBytes += ctxs[i].st.bytesTouched;
-            if (clients[i].first) LOGI("[TASX] Page-in PID %lu: %llu pages touched, %llu failed | ~%llu KB",
-                clients[i].first,
-                (unsigned long long)ctxs[i].st.touchedPages,
-                (unsigned long long)ctxs[i].st.failedPages,
-                (unsigned long long)(ctxs[i].st.bytesTouched >> 10));
-            if (ctxs[i].h != clients[i].second) CloseHandle(ctxs[i].h);
-        }
+    for (size_t i = 0; i < job->clients.size(); ++i) {
+        clientsDone++;
+        totalAttempted += ctxs[i].st.attemptedPages;
+        totalTouched += ctxs[i].st.touchedPages;
+        totalFailed += ctxs[i].st.failedPages;
+        totalBytes += ctxs[i].st.bytesTouched;
+        LOGI("[TASX] Page-in PID %lu: %llu pages touched, %llu failed | ~%llu KB",
+             job->clients[i].first,
+             (unsigned long long)ctxs[i].st.touchedPages,
+             (unsigned long long)ctxs[i].st.failedPages,
+             (unsigned long long)(ctxs[i].st.bytesTouched >> 10));
+        CloseHandle(ctxs[i].h); // always our own duplicate - always ours to close
+        ctxs[i].h = nullptr;
+        job->clients[i].second = nullptr;
     }
 
     ULONGLONG t1 = GetTickCount64();
-    TrimmerSetPageInPause(0);
-    g_pageInBusy = false;
     LOGI("[TASX] Page-in complete (%lu ms): %u clients | %llu pages attempted, %llu touched, %llu failed | ~%llu MB fetched",
          (unsigned long)(t1 - t0), clientsDone,
          (unsigned long long)totalAttempted,
          (unsigned long long)totalTouched,
          (unsigned long long)totalFailed,
          (unsigned long long)(totalBytes >> 20));
+
+    } catch (const std::exception& ex) {
+        LOGW("[TASX] Page-in farm worker exception: %s; operation aborted safely", ex.what());
+    } catch (...) {
+        LOGW("[TASX] Page-in farm worker exception; operation aborted safely");
+    }
+    return 0;
+}
+
+void PageInFarm()
+{
+    /* Reap a completed page-in worker before starting another one.
+       The main loop is the sole owner of this thread handle. */
+    if (g_pageInThread && !g_pageInBusy.load()) {
+        WaitForSingleObject(g_pageInThread, INFINITE);
+        CloseHandle(g_pageInThread);
+        g_pageInThread = nullptr;
+    }
+
+    bool expected = false;
+    if (!g_pageInBusy.compare_exchange_strong(expected, true)) {
+        LOGI("[TASX] Page-in already running (hotkey ignored)");
+        return;
+    }
+
+    /* The only part that touches g_rbxHandles - runs on the main thread,
+       which is the sole owner, exactly like everywhere else in this file.
+       We duplicate every handle so the worker thread never depends on the
+       main thread's copy staying alive/valid. */
+    auto job = std::make_unique<PageInJob>();
+    job->clients.reserve(g_rbxHandles.size());
+    for (auto& kv : g_rbxHandles) {
+        HANDLE dup = nullptr;
+        if (DuplicateHandle(GetCurrentProcess(), kv.second, GetCurrentProcess(),
+                            &dup, 0, FALSE, DUPLICATE_SAME_ACCESS) && dup)
+            job->clients.push_back({kv.first, dup});
+    }
+
+    if (job->clients.empty()) {
+        g_pageInBusy.store(false);
+        LOGI("[TASX] Page-in: no clients to touch");
+        return;
+    }
+
+    TrimmerSetPageInPause(1);
+
+    PageInJob* raw = job.release();
+    HANDLE th = CreateThread(nullptr, 0, PageInFarmWorkerMain, raw, 0, nullptr);
+    if (!th) {
+        LOGE("[TASX] Page-in: failed to start worker thread");
+        delete raw;
+        TrimmerSetPageInPause(0);
+        g_pageInBusy.store(false);
+        return;
+    }
+    g_pageInThread = th; // main thread reaps it on next run or shutdown
+}
+
+void PageInFarmStop()
+{
+    if (!g_pageInThread) return;
+    /* The worker owns only duplicated process handles, but it still logs and
+       clears the page-in/trimmer state. Join it before those dependencies are
+       torn down and before the logger is closed. */
+    WaitForSingleObject(g_pageInThread, INFINITE);
+    CloseHandle(g_pageInThread);
+    g_pageInThread = nullptr;
+}
+
+/* FarmBoost (Ctrl+Alt+B): toggles the whole background cgroup (all tracked,
+   non-focused clients) between the normal IDLE/E-cores/EcoQoS-on policy and
+   a full-power NORMAL/all-cores/EcoQoS-off/trim-paused one. The focused
+   instance (if any) is untouched either way - it already runs full power
+   via CpuApplyFocusProfile. */
+void ToggleFarmBoost()
+{
+    bool on = !g_farmBoostOn.load();
+    g_farmBoostOn.store(on);
+
+    JobsSetFarmBoost(on ? 1 : 0);
+    TrimmerSetFarmBoost(on ? 1 : 0);
+
+    // EcoQoS is per-process, so flip it for every job-tracked background
+    // client here (jobs.cc only tracks pid->state, not handles).
+    for (auto& kv : g_rbxHandles) {
+        if (kv.first == g_appliedFocus) continue; // focused instance untouched
+        SetPriorityClass(kv.second, on ? NORMAL_PRIORITY_CLASS : IDLE_PRIORITY_CLASS);
+        tasx_process_power_throttling(kv.second, on ? 0 : 1);
+    }
+
+    JobsRefreshDynamic(g_appliedFocus != 0);
+    ApplyPerProcessAffinityPolicy();
+
+    LOGI("[TASX] FarmBoost %s (Ctrl+Alt+B): background clients now %s",
+         on ? "ON" : "OFF",
+         on ? "NORMAL priority / all cores / EcoQoS off / trim paused"
+            : "IDLE priority / E-cores (or low half) / EcoQoS on / trim active");
 }
 
 /* Timer resolution: 0.5 ms tick while Roblox is running -> smoother frame
@@ -798,11 +1033,11 @@ static bool SystemCleanEmptyWSAllowed()
 
 void SystemCleanPass(bool announce)
 {
-    if (!config_get_bool("TASX", "SystemCleaner", 1)) return;
+    if (!config_get_bool("TASX", "SystemCleaner", 0)) return;
     if (!tasx_is_elevated()) return;
 
     bool standby = false, emptied = false;
-    if (config_get_bool("TASX", "SystemCleanStandby", 1))
+    if (config_get_bool("TASX", "SystemCleanStandby", 0))
         standby = tasx_purge_standby_list() != 0;
     // Global empty-WS never touches a focused client and never runs on a
     // keep-hot farm unless explicitly opted in (SystemCleanEmptyWS=1).
@@ -818,9 +1053,14 @@ void SystemCleanPass(bool announce)
 /* Kernel wakes us only when commit memory runs low -> no cleaning timer. */
 void LowMemReactorStart()
 {
-    if (!config_get_bool("TASX", "LowMemReactor", 1)) return;
+    if (!config_get_bool("TASX", "LowMemReactor", 0)) return;
+    if (!g_stopEvent) {
+        LOGW("[TASX] Low-memory reactor disabled: shutdown event unavailable");
+        return;
+    }
+    if (g_lowMemThread) return;
 
-    HANDLE hThread = CreateThread(nullptr, 0, [](LPVOID)->DWORD {
+    g_lowMemThread = CreateThread(nullptr, 0, [](LPVOID)->DWORD {
         HANDLE hLow = CreateMemoryResourceNotification(LowMemoryResourceNotification);
         if (!hLow) {
             LOGW("[TASX] Low-memory notification unavailable");
@@ -844,7 +1084,19 @@ void LowMemReactorStart()
         CloseHandle(hLow);
         return 0;
     }, nullptr, 0, nullptr);
-    if (hThread) CloseHandle(hThread);
+    if (!g_lowMemThread)
+        LOGW("[TASX] Failed to start low-memory reactor thread");
+}
+
+void LowMemReactorStop()
+{
+    if (!g_lowMemThread) return;
+    if (g_stopEvent) SetEvent(g_stopEvent);
+    /* The reactor owns hLow and snapshots g_stopEvent into its wait set.
+       Join before closing either handle or shutting down the logger. */
+    WaitForSingleObject(g_lowMemThread, INFINITE);
+    CloseHandle(g_lowMemThread);
+    g_lowMemThread = nullptr;
 }
 
 void CheckIniReload()
@@ -876,6 +1128,7 @@ void HandleConfigChanged()
     FFlagsApply();
     TweaksApplyOneShot();
     JobsRefreshDynamic(g_appliedFocus != 0);
+    ApplyPerProcessAffinityPolicy();
 }
 
 static std::wstring GetPagefileVolumeRoot()
@@ -948,7 +1201,7 @@ void HandleRobloxCreated(DWORD pid)
     ApplyFocusIfChanged(); /* the new instance may already be the foreground */
 
     if (isNew && g_rbxHandles.count(pid)) {
-        if (tasx_is_elevated() && config_get_bool("TASX", "PurgeStandbyOnLaunch", 1)) {
+        if (tasx_is_elevated() && config_get_bool("TASX", "PurgeStandbyOnLaunch", 0)) {
             // Debounced: a 30-client pack spawns 30 events, one purge is enough.
             static ULONGLONG lastLaunchPurgeMs = 0;
             ULONGLONG nowPurge = GetTickCount64();
@@ -970,6 +1223,12 @@ void HandleRobloxCreated(DWORD pid)
 
 void HandleRobloxExited(DWORD pid)
 {
+    /* WMI, Job Object and RegisterWait can all report the same exit. Only
+       the first event that still owns the PID may trigger cleanup/respawn;
+       this makes the operation idempotent and prevents duplicate launches. */
+    if (!g_rbxHandles.count(pid))
+        return;
+
     ReleaseClient(pid, true);
     // commit block auto-unblocks on next hook due to fresh check
 
@@ -983,6 +1242,30 @@ void HandleRobloxExited(DWORD pid)
     RespawnTrySpawn(pid);
 }
 
+/* RegisterWait is the normal exit path, but it can fail under handle/thread
+   pressure. A cheap readiness check on the owned process handles is the
+   final liveness backstop and also repairs a lost WMI/job notification. */
+void SweepTrackedClients()
+{
+    std::vector<DWORD> exited;
+    exited.reserve(g_rbxHandles.size());
+
+    for (const auto& kv : g_rbxHandles) {
+        DWORD result = WaitForSingleObject(kv.second, 0);
+        if (result == WAIT_OBJECT_0)
+            exited.push_back(kv.first);
+        else if (result == WAIT_FAILED &&
+                 LogRateLimit("tracked-wait-fail", 60))
+            LOGW("[TASX] Liveness check failed for tracked PID %lu (err %lu)",
+                 kv.first, (unsigned long)GetLastError());
+    }
+
+    for (DWORD pid : exited) {
+        if (g_rbxHandles.count(pid))
+            HandleRobloxExited(pid);
+    }
+}
+
 /* Ini hygiene: warn once per unknown section|key (typos like BackgroudCpuCap
    otherwise fail silently into defaults). [FastFlags] accepts any flag name
    (filtered separately by the FFlags allowlist), so only its section name
@@ -993,6 +1276,13 @@ static void ValidateIniKeys()
     static const char* known[] = {
         "tasx|trimunfocused", "tasx|trimintervalsec", "tasx|adaptivetrim",
         "tasx|trimskipbelowmb", "tasx|farmkeephot", "tasx|hardtrimaftersec",
+        "tasx|trimmetrics", "tasx|trimlogintervalsec", "tasx|idletrimenabled",
+        "tasx|idletrimsec", "tasx|idletrimcpupct", "tasx|idletrimnetworkbytes",
+        "tasx|idletrimsampleintervalsec", "tasx|perclientcommitlimitmb",
+        "tasx|commitlimitaction", "tasx|commitlimitcooldownsec",
+        "tasx|commitcheckintervalsec", "tasx|memoryflags",
+        "tasx|budgetplannerenabled", "tasx|budgetplannerlogintervalsec",
+        "tasx|dynamicmemorycapenforce",
         "tasx|backgroundmempriority", "tasx|jobassignmode",
         "tasx|backgroundcpucappercent",
         "tasx|jobcpucappercent",
@@ -1091,7 +1381,12 @@ int InitSubsystems()
     }
 
     g_singleInstanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\TASX_Optimizer_Mutex");
-    if (g_singleInstanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+    if (!g_singleInstanceMutex) {
+        LOGE("[TASX] Cannot create single-instance mutex (err %lu); refusing to start safely",
+             (unsigned long)GetLastError());
+        return 0;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
 #ifdef TASX_CONSOLE
         LOGI("[TASX] TASX is already running in the background (agent autostart or another window).");
         LOGI("[TASX] Nothing is broken - this window closes in 5 seconds.");
@@ -1105,6 +1400,11 @@ int InitSubsystems()
         return 0;
     }
 
+    /* Only the instance that owns the mutex may recover a stale global power
+       journal. A second launch must never restore the scheme underneath an
+       already-running agent. */
+    TweaksPowerRecoverStale();
+
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
@@ -1115,6 +1415,8 @@ int InitSubsystems()
     bool elevated = tasx_is_elevated() != 0;
 
     CpuInit();
+    if (!config_get_bool("TASX", "TrimUnfocused", 0))
+        LOGW("[Trimmer] WARN: триммер отключён пользователем (TrimUnfocused=0)");
     if (config_get_bool("TASX", "DisableCpuBoost", 0)) {
         if (elevated)
             CpuSetBoostMode(0);
@@ -1127,7 +1429,13 @@ int InitSubsystems()
     SystemCleanPass(true);
 
     bool jobsOk = JobsInit();
-    if (!config_get_bool("TASX", "TrimUnfocused", 1)) StopAllTrimmers();
+    if (config_get_bool("TASX", "FarmBoostDefault", 0))
+        ToggleFarmBoost(); // starts boosted, per FarmBoostDefault=1
+    if (!config_get_bool("TASX", "TrimUnfocused", 0)) StopAllTrimmers();
+    if (config_get_bool("TASX", "MemoryFlags", 0))
+        LOGI("[FFlags] MemoryFlags=1 requested; only verified allowlist entries will be considered");
+    if (config_get_bool("TASX", "DynamicMemoryCapEnforce", 0))
+        LOGW("[Budget] DynamicMemoryCapEnforce=1 is opt-in; cap enforcement remains disabled until measured rollback support is available");
 
     // Startup banner: admin status, job mode, enabled/disabled features.
     // Printed ONCE - replaces the old per-feature "needs admin" spam.
@@ -1137,12 +1445,18 @@ int InitSubsystems()
     if (!elevated) {
         LOGI("[TASX] Limited mode WITHOUT admin - DISABLED: standby purge, system cleaner, HKLM tweaks, ETW, CPU boost. ENABLED: priority, affinity, FFlags, crash-handler kill, trimmer(soft). Run Install\\ScheduledTaskInstaller.bat for full effect.");
     } else {
-        LOGI("[TASX] Features: priority, affinity, jobs, FFlags, trimmer, standby purge, system cleaner, HKLM tweaks - all ENABLED");
+        LOGI("[TASX] Features: priority/affinity/jobs/FFlags=ON | trimmer=%s | standby-clean=%s | system-cleaner=%s | HKLM-tweaks=%s | power-plan=%s",
+             config_get_bool("TASX", "TrimUnfocused", 0) ? "ON" : "OFF",
+             (config_get_bool("TASX", "SystemCleanStandby", 0) ||
+              config_get_bool("TASX", "PurgeStandbyOnLaunch", 0)) ? "ON" : "OFF",
+             config_get_bool("TASX", "SystemCleaner", 0) ? "ON" : "OFF",
+             config_get_bool("TASX", "ApplyTweaks", 0) ? "ON" : "OFF",
+             config_get_bool("TASX", "PowerPlan", 0) ? "ON" : "OFF");
     }
 
     // FPS config sanity (single place): UncapFps=1 makes TargetFps
     // meaningless - the FFlags writer ignores it and uncaps to 999.
-    if (config_get_bool("Roblox", "UncapFps", 1)) {
+    if (config_get_bool("Roblox", "UncapFps", 0)) {
         int tf = config_get_int("Roblox", "TargetFps", 999);
         if (tf < 240 && LogRateLimit("fps-conflict", 3600))
             LOGW("[FFlags] WARNING: UncapFps=1 conflicts with TargetFps=%d -> TargetFps ignored (uncapped)", tf);
@@ -1183,12 +1497,23 @@ void ShutdownSubsystems()
     g_hotkey = nullptr;
     delete g_hook;
     g_hook = nullptr;
+    AudioShutdown();
     _wmishutdown();
+    WarmShutdown();
+    /* Release every owned process handle and wait registration before
+       destroying the job. This makes restart/upgrade paths clean and, with
+       KillOnAgentExit=0, guarantees that shutting TASX down does not leave
+       stale state or terminate the clients. */
+    while (!g_rbxHandles.empty())
+        ReleaseClient(g_rbxHandles.begin()->first, false);
+    PageInFarmStop();
     StopAllTrimmers();
+    LowMemReactorStop();
     JobShutdown();
     TimerOff();
     TweaksPowerExit();
     RespawnClearAll();
+    MetricsReset();
     if (g_stopEvent) {
         SetEvent(g_stopEvent);
         CloseHandle(g_stopEvent);
@@ -1219,7 +1544,7 @@ int RunTasx()
             case Ev::JobChild:      KillCrashHandlerPid(ev->pid); break;
             case Ev::Focus:         ApplyFocusIfChanged();        break;
             case Ev::ConfigChanged: HandleConfigChanged();        break;
-            case Ev::HotkeyBoost:   PageInFarm();                 break;
+            case Ev::HotkeyBoost:   ToggleFarmBoost();            break;
             case Ev::LowMem: {
                 static ULONGLONG lastLowMemCleanMs = 0;
                 ULONGLONG now = GetTickCount64();
@@ -1229,15 +1554,18 @@ int RunTasx()
                 }
                 lastLowMemCleanMs = now;
                 LOGI("[TASX] Low memory event -> reactive clean");
-                tasx_purge_standby_list();
+                /* LowMemReactor and global standby purge are separate
+                   controls.  A user who opted into event detection must not
+                   also receive a system-wide purge unless explicitly opting
+                   into SystemCleanStandby. */
+                if (config_get_bool("TASX", "SystemCleanStandby", 0))
+                    tasx_purge_standby_list();
                 TrimmerTrimAllAggressive();
                 // SystemCleanPass is internally split: standby always, global
                 // empty-WS only when allowed AND nothing focused.
                 if (g_appliedFocus == 0) {
                     SystemCleanPass(true);
                 } else {
-                    if (config_get_bool("TASX", "SystemCleanStandby", 1))
-                        tasx_purge_standby_list(); // safe half still applies
                     LOGI("[TASX] Skipped system clean (focused PID %lu active)", g_appliedFocus);
                 }
                 break;
@@ -1245,24 +1573,40 @@ int RunTasx()
             }
         }
 
+        if (g_reconcileNeeded.exchange(false, std::memory_order_acq_rel)) {
+            unsigned long dropped =
+                g_droppedQueueEvents.exchange(0, std::memory_order_acq_rel);
+            if (dropped && LogRateLimit("event-queue-pressure", 60))
+                LOGW("[TASX] Event queue saturated; dropped %lu notification(s), reconciling tracked processes",
+                     dropped);
+            SweepTrackedClients();
+            SweepDiscover();
+        }
+
         // Focus safety net (hook may miss exotic switches): PopEvent timeout 250ms already does cadence via loop
         // But also ensure ApplyFocus on each iteration (lightweight, does GetForegroundWindow)
         ApplyFocusIfChanged();
         RetryBlockedHooks();
+        RespawnRetryPending();
 
         ULONGLONG now = GetTickCount64();
 
-        // Auto page-in every N minutes (default 300 = 5 min) when clients active
-        int pageInSec = config_get_int("TASX", "PageInIntervalSec", 300);
-        if (pageInSec > 0 && !g_rbxHandles.empty() && (now - g_lastPageInMs) >= (ULONGLONG)pageInSec * 1000 && !g_pageInBusy) {
+        // Auto page-in every N minutes when explicitly enabled; default is
+        // manual-only because a full private-memory read is intentionally I/O-heavy.
+        int pageInSec = config_get_int("TASX", "PageInIntervalSec", 0);
+        if (pageInSec > 0 && !g_rbxHandles.empty() && (now - g_lastPageInMs) >= (ULONGLONG)pageInSec * 1000 && !g_pageInBusy.load()) {
             g_lastPageInMs = now;
             PageInFarm();
         }
 
         // Periodic WS cache refresh ~10s, plus GDI guard, audio refresh, dynamic jobs
         if (now - g_lastWsUpdateMs >= 10000) {
-            // discovery only if WMI unhealthy; otherwise WS cache update suffices
-            if (!g_wmiOk) SweepDiscover();
+            SweepTrackedClients();
+            /* WMI is an acceleration path, not the sole source of truth.
+               Providers can lose a subscription after startup without making
+               the original _wmimon() call fail; periodic reconciliation keeps
+               newly launched clients discoverable in that case too. */
+            SweepDiscover();
             UpdateWorkingSetCache();
             for (auto& kv : g_rbxHandles)
                 DesktopCheckClient(kv.first, kv.second);
@@ -1271,6 +1615,10 @@ int RunTasx()
             JobsRefreshDynamic(g_appliedFocus != 0);
             CheckIniReload();
             HungSweep(); // hung-client watchdog (opt-in, logs/kills)
+            MetricsSampleClients(now);
+            MetricsMaybeReport(now);
+            MetricsCheckCommitLimits(now);
+            MetricsMaybeReportBudget(now);
         }
 
         // Crash handlers: only every 60s plus on RBX_ON/JobChild
@@ -1311,10 +1659,28 @@ int RunTasx()
     return 0;
 }
 
+/* Last-resort boundary for C++ failures in the long-running agent. The
+   subsystems are intentionally written so ShutdownSubsystems is idempotent;
+   keeping this boundary here prevents an allocation/container failure from
+   skipping handle release, power rollback, WMI drain, and worker joins. */
+int RunTasxSafely()
+{
+    try {
+        return RunTasx();
+    } catch (const std::exception& ex) {
+        LOGE("[TASX] Unhandled runtime exception: %s; entering safe shutdown", ex.what());
+    } catch (...) {
+        LOGE("[TASX] Unhandled runtime exception; entering safe shutdown");
+    }
+    ShutdownSubsystems();
+    return 2;
+}
+
 } /* namespace */
 
 /* --- CLI helpers (console build) -------------------------------------- */
 
+#ifdef TASX_CONSOLE
 static void CliPrintUsage(void)
 {
     printf("TASX usage:\n"
@@ -1440,6 +1806,7 @@ static int CliSetPreset(const char* name)
     printf("TASX --preset: [FastFlags] Preset=%s written to %s\n", name, g_iniPath);
     return 0;
 }
+#endif /* TASX_CONSOLE */
 
 #ifdef TASX_CONSOLE
 int main(int argc, char** argv)
@@ -1460,7 +1827,7 @@ int main(int argc, char** argv)
             return 1;
         }
     }
-    return RunTasx();
+    return RunTasxSafely();
 }
 #else
 int WINAPI WinMain(
@@ -1469,6 +1836,6 @@ int WINAPI WinMain(
     _In_ LPSTR,
     _In_ int)
 {
-    return RunTasx();
+    return RunTasxSafely();
 }
 #endif

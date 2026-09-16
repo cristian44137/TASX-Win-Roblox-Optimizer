@@ -11,3 +11,8 @@ void TweaksApplyOneShot();
    last instance closes to restore the previous scheme. */
 void TweaksPowerEnter();
 void TweaksPowerExit();
+
+/* Restores a power scheme left behind by a previous crashed agent run.
+   Safe to call on every startup; a journal is deleted only after a confirmed
+   successful restore. */
+void TweaksPowerRecoverStale();

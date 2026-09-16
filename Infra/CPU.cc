@@ -54,8 +54,7 @@ void LogSummary()
     else
         LOGI("[TASX] CPU: %u logical cores (non-hybrid, background -> low half)",
              logical);
-    LOGI("[TASX] Focus profile -> all cores + HIGH priority; background -> %s + IDLE + efficiency mode",
-         hybrid ? "E-cores" : "low half");
+    LOGI("[TASX] Focus profile -> all cores + HIGH priority; background -> all cores + IDLE + efficiency mode (DynamicAffinity=1 enables E-core split)");
 }
 
 } /* namespace */
@@ -145,7 +144,8 @@ bool CpuPageInProcess(HANDLE hProcess, CpuPageInStats* stats)
         if (!queried) break;
         uintptr_t regionBase = (uintptr_t)mbi.BaseAddress;
         uintptr_t regionEnd = regionBase + (uintptr_t)mbi.RegionSize;
-        if (regionEnd < regionBase || regionEnd <= regionBase) { base = regionEnd; continue; }
+        if (regionEnd <= regionBase)
+            break; /* corrupt/overflowed range: never loop on the same base */
         if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE) {
             DWORD p = mbi.Protect & 0xFF;
             bool readable = (p != PAGE_NOACCESS && p != PAGE_GUARD);
@@ -198,8 +198,6 @@ bool CpuApplyFocusProfile(HANDLE hProcess, int focused)
     LogSummary();
 
     DWORD pid = GetProcessId(hProcess);
-    DWORD_PTR pMask = (DWORD_PTR)tasx_get_pcore_mask();
-    DWORD_PTR eMask = (DWORD_PTR)tasx_get_ecore_mask();
     DWORD_PTR allMask = (DWORD_PTR)tasx_get_all_mask();
 
     if (focused) {

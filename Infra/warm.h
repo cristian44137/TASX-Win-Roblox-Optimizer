@@ -15,3 +15,7 @@
    standby cache -> one warm pass serves all 100+ instances. No injection,
    no client memory is touched. Runs on a detached thread per hook. */
 void WarmClientFilesAsync(DWORD pid);
+
+/* Stops accepting new warm jobs and joins all workers. Must run before the
+   process logger and shared runtime state are destroyed. */
+void WarmShutdown();

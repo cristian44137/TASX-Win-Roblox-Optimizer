@@ -745,8 +745,10 @@ TASX_SYS_PROC* tasx_query_system_processes(void)
     }
     if (!fn) return NULL;
 
+    const unsigned long maxSize = 128ul << 20;
     unsigned long size = 1ul << 20;
     for (int attempt = 0; attempt < 4; ++attempt) {
+        if (size > maxSize) return NULL;
         unsigned char* buf = (unsigned char*)malloc(size);
         if (!buf) return NULL;
 
@@ -756,7 +758,13 @@ TASX_SYS_PROC* tasx_query_system_processes(void)
             return (TASX_SYS_PROC*)buf;
 
         free(buf);
-        size = needed > size ? needed + (1ul << 20) : size + (1ul << 20);
+        unsigned long next = size + (1ul << 20);
+        if (needed > size) {
+            if (needed > maxSize - (1ul << 20)) return NULL;
+            next = needed + (1ul << 20);
+        }
+        if (next <= size) return NULL; /* overflow guard */
+        size = next > maxSize ? maxSize : next;
     }
     return NULL;
 }
@@ -802,8 +810,13 @@ int tasx_read_cmdline(HANDLE hProc, wchar_t* out, int outLen)
         if (chars > avail) chars = avail;
         if (chars > (size_t)outLen - 1) chars = (size_t)outLen - 1;
         if (chars) memcpy(out, buf + 4, chars * sizeof(wchar_t));
+        /* Trim a trailing embedded NUL reported inside strLen (some
+           versions include it) so `chars` reflects the actual string
+           length rather than counting a phantom character. FIX: the old
+           code compared out[chars-1] to L'\0' and then reassigned it to
+           the same value - a no-op that never actually shortened `chars`. */
+        if (chars && out[chars - 1] == L'\0') --chars;
         out[chars] = L'\0';
-        if (chars && out[chars - 1] == L'\0') out[chars - 1] = L'\0'; /* trim NUL */
         ok = 1;
     }
     free(buf);
