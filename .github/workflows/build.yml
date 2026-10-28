@@ -24,7 +24,7 @@ jobs:
         }
 
     - name: Corregir TASX.vcxproj y compilar con NOMINMAX y UTF-8
-       env:
+      env:
         CL: "/DNOMINMAX /utf-8"
       run: |
         (Get-Content TASX.vcxproj) -replace '<ControlFlowGuard>true</ControlFlowGuard>', '<ControlFlowGuard>Guard</ControlFlowGuard>' | Set-Content TASX.vcxproj
