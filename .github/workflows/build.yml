@@ -1,0 +1,28 @@
+name: Build TASX Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Descargar codigo fuente
+      uses: actions/checkout@v4
+
+    - name: Configurar MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Compilar TASX.vcxproj en modo Release
+      run: msbuild TASX.vcxproj /p:Configuration=Release /p:Platform=x64
+
+    - name: Subir ejecutable compilado
+      uses: actions/upload-artifact@v4
+      with:
+        name: TASX-Release-Build
+        path: |
+          **/Release/*.exe
+          Install/*.bat
