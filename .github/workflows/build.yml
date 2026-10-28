@@ -17,12 +17,17 @@ jobs:
       uses: microsoft/setup-msbuild@v2
 
     - name: Compilar TASX.vcxproj en modo Release
-      run: msbuild TASX.vcxproj /p:Configuration=Release /p:Platform=x64
+      run: |
+        msbuild TASX.vcxproj /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
+
+    - name: Preparar carpeta final con EXE y BAT
+      run: |
+        mkdir dist
+        Get-ChildItem -Path . -Filter "TASX.exe" -Recurse | Copy-Item -Destination "dist\"
+        Copy-Item -Path "Install\*.bat" -Destination "dist\"
 
     - name: Subir ejecutable compilado
       uses: actions/upload-artifact@v4
       with:
-        name: TASX-Release-Build
-        path: |
-          **/Release/*.exe
-          Install/*.bat
+        name: TASX-Ready-To-Use
+        path: dist/*
