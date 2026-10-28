@@ -16,15 +16,16 @@ jobs:
     - name: Configurar MSBuild
       uses: microsoft/setup-msbuild@v2
 
-    - name: Compilar TASX.vcxproj en modo Release
+    - name: Corregir bug de ControlFlowGuard y compilar TASX.vcxproj
       run: |
-        msbuild TASX.vcxproj /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
+        (Get-Content TASX.vcxproj) -replace '<ControlFlowGuard>true</ControlFlowGuard>', '<ControlFlowGuard>Guard</ControlFlowGuard>' | Set-Content TASX.vcxproj
+        msbuild TASX.vcxproj /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0
 
     - name: Preparar carpeta final con EXE y BAT
       run: |
         mkdir dist
         Get-ChildItem -Path . -Filter "TASX.exe" -Recurse | Copy-Item -Destination "dist\"
-        Copy-Item -Path "Install\*.bat" -Destination "dist\"
+        if (Test-Path "Install") { Copy-Item -Path "Install\*.bat" -Destination "dist\" }
 
     - name: Subir ejecutable compilado
       uses: actions/upload-artifact@v4
