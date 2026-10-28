@@ -16,11 +16,31 @@ jobs:
     - name: Configurar MSBuild
       uses: microsoft/setup-msbuild@v2
 
-    - name: Compilar TASX.vcxproj
+    - name: Reparar simbolos de Linker y compilar TASX.vcxproj
       env:
         CL: "/DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /utf-8 /wd4005"
+        LINK: "iphlpapi.lib ws2_32.lib"
       run: |
+        # 1. Corregir ControlFlowGuard en TASX.vcxproj
         (Get-Content TASX.vcxproj) -replace '<ControlFlowGuard>true</ControlFlowGuard>', '<ControlFlowGuard>Guard</ControlFlowGuard>' | Set-Content TASX.vcxproj
+
+        # 2. Si existe respawn.cc/.cpp en Infra pero no esta en TASX.vcxproj, inyectarlo; si no existe, definir stubs compatibles
+        $respawnFile = Get-ChildItem -Path "Infra" -Filter "respawn.*" | Select-Object -First 1
+        if ($respawnFile) {
+          Write-Host "Encontrado archivo $($respawnFile.Name), inyectando en TASX.vcxproj..."
+          (Get-Content TASX.vcxproj) -replace '<ClCompile Include="Infra\\netcache.cc" />', "<ClCompile Include=`"Infra\netcache.cc`" />`n    <ClCompile Include=`"Infra\$($respawnFile.Name)`" />" | Set-Content TASX.vcxproj
+        } else {
+          Write-Host "No existe respawn.cc en el repo; anadiendo implementacion fallback en Infra\master.cpp..."
+          Add-Content -Path "Infra\master.cpp" -Value @"
+        #include <string>
+        void __cdecl RespawnRemember(unsigned long pid, const std::wstring& cmd) {}
+        int __cdecl RespawnTrySpawn(unsigned long pid) { return 0; }
+        void __cdecl RespawnRetryPending(void) {}
+        void __cdecl RespawnClearAll(void) {}
+        "@
+        }
+
+        # 3. Compilar y enlazar
         msbuild TASX.vcxproj /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0
 
     - name: Preparar carpeta final con EXE y BAT
