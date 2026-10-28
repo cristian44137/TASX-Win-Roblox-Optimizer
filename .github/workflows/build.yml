@@ -16,7 +16,16 @@ jobs:
     - name: Configurar MSBuild
       uses: microsoft/setup-msbuild@v2
 
-    - name: Corregir bug de ControlFlowGuard y compilar TASX.vcxproj
+    - name: Mostrar lineas 195-255 de Infra\warm.cc
+      run: |
+        $lines = Get-Content "Infra\warm.cc"
+        for ($i = 194; $i -lt [Math]::Min(256, $lines.Count); $i++) {
+          Write-Host ("{0}: {1}" -f ($i + 1), $lines[$i])
+        }
+
+    - name: Corregir TASX.vcxproj y compilar con NOMINMAX y UTF-8
+       env:
+        CL: "/DNOMINMAX /utf-8"
       run: |
         (Get-Content TASX.vcxproj) -replace '<ControlFlowGuard>true</ControlFlowGuard>', '<ControlFlowGuard>Guard</ControlFlowGuard>' | Set-Content TASX.vcxproj
         msbuild TASX.vcxproj /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0
